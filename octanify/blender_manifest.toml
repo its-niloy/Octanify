@@ -1,0 +1,11 @@
+schema_version = "1.0.0"
+
+id = "octanify"
+name = "Octanify"
+version = "1.0.0"
+tagline = "Convert Cycles materials to Octane materials with one click"
+maintainer = "Niloy Bhowmick"
+type = "add-on"
+license = ["SPDX:GPL-3.0-or-later"]
+
+blender_version_min = "4.2.0"
