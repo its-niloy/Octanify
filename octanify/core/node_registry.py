@@ -165,10 +165,14 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
     ],
     "ShaderNodeMix": [
         "OctaneCyclesMixColorNodeWrapper",
-        "OctaneCyclesMixFloatNodeWrapper",
-        "OctaneCyclesMixFloat3NodeWrapper",
         "ShaderNodeOctMixTex",
         "OctaneMixTexture",
+    ],
+    "ShaderNodeMixFloat": [
+        "OctaneCyclesMixFloatNodeWrapper",
+    ],
+    "ShaderNodeMixFloat3": [
+        "OctaneCyclesMixFloat3NodeWrapper",
     ],
     "ShaderNodeInvert": [
         "ShaderNodeOctInvertTex",
@@ -187,15 +191,12 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneGammaCorrection",
     ],
     "ShaderNodeRGBCurves": [
-        "NodeReroute"
+        "OctaneColorCorrection",
+        "ShaderNodeOctColorCorrectionTex",
     ],
     "ShaderNodeMath": [
-        "ShaderNodeOctMathTex",
-        "ShaderNodeOctMath",
-        "ShaderNodeOctCyclesMath",
-        "ShaderNodeOctFloatMathTex",
-        "OctaneMath",
-        "OctaneFloatMath",
+        "OctaneCyclesNodeMathNodeWrapper",
+        "OctaneBinaryMathOperation",
     ],
     "ShaderNodeMapRange": [
         "ShaderNodeOctRangeTex",
@@ -250,8 +251,8 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "ShaderNodeOctBumpMap",
     ],
     "ShaderNodeDisplacement": [
+        "OctaneTextureDisplacement",
         "ShaderNodeOctDisplacementTex",
-        "OctaneDisplacement",
     ],
     "ShaderNodeRGB": [
         "ShaderNodeOctRGBColorTex",
@@ -282,12 +283,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneDirtTexture",
     ],
     "ShaderNodeVectorMath": [
-        "ShaderNodeOctVectorMathTex",
-        "ShaderNodeOctVectorMath",
-        "ShaderNodeOctCyclesVectorMath",
-        "OctaneVectorMath",
-        "ShaderNodeOctAddTex",
-        "OctaneAddTexture",
+        "OctaneCyclesNodeVectorMathNodeWrapper",
     ],
     "ShaderNodeVectorRotate": [
         "ShaderNodeOct3DTransform",
@@ -298,8 +294,8 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneTransform3D",
     ],
     "ShaderNodeVectorDisplacement": [
-        "ShaderNodeOctDisplacementTex",
-        "OctaneDisplacement",
+        "OctaneVertexDisplacement",
+        "ShaderNodeOctVertexDisplacementTex",
     ],
     "ShaderNodeNormal": [
         "ShaderNodeOctNormalMapTex",
@@ -599,6 +595,16 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "A":       ["Texture1", "Color1", "Input1"],
         "B":       ["Texture2", "Color2", "Input2"],
     },
+    "ShaderNodeMixFloat": {
+        "Factor":  ["Amount", "Factor"],
+        "A":       ["Texture1", "Color1", "Input1"],
+        "B":       ["Texture2", "Color2", "Input2"],
+    },
+    "ShaderNodeMixFloat3": {
+        "Factor":  ["Amount", "Factor"],
+        "A":       ["Texture1", "Color1", "Input1"],
+        "B":       ["Texture2", "Color2", "Input2"],
+    },
     "ShaderNodeInvert": {
         "Fac":   ["Amount", "Factor"],
         "Color": ["Texture", "Input"],
@@ -790,6 +796,12 @@ OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Color": ["OutTex", "Texture out", "Output"],
     },
     "ShaderNodeMix": {
+        "Result": ["OutTex", "Texture out", "Output"],
+    },
+    "ShaderNodeMixFloat": {
+        "Result": ["OutTex", "Texture out", "Output"],
+    },
+    "ShaderNodeMixFloat3": {
         "Result": ["OutTex", "Texture out", "Output"],
     },
     "ShaderNodeInvert": {

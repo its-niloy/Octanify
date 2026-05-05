@@ -50,9 +50,9 @@ def _find_albedo_image_nodes(
 ) -> list[bpy.types.Node]:
     """Find image texture nodes connected to albedo/base color/diffuse inputs."""
     albedo_names = {
-        "Albedo color", "Albedo", "Diffuse",
+        "Albedo color", "Albedo", "Diffuse", "Base color", "Base Color",
         "Emission", "Emission color",
-        "Texture1", "Texture2", "Color1", "Color2",
+        "Texture1", "Texture2", "Color1", "Color2", "Input1", "Input2", "A", "B",
         "Reflection", "Specular",
     }
 

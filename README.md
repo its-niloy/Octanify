@@ -32,12 +32,15 @@ Once installed, press `N` in the 3D Viewport or Shader Editor to open the sideba
 │ █▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀█ │
 │ █            CONVERT TO OCTANE             █ │
 │ █▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄█ │
+│   [ ↺ Revert to Cycles                     ] │
 │                                              │
 │ ▼ Batch Object Conversion:                   │
 │   [ ◉ Active Object ]    [ ○ All Objects ]   │
 │                                              │
-│ ▼ Albedo Gamma Control:                      │
+│ ▼ Albedo Gamma & Update Tools:               │
 │   Albedo Gamma    <────────[ 2.20 ]────────> │
+│   [ 🖌️ Update Selected Material            ] │
+│   [ 🌍 Update All Materials                ] │
 │                                              │
 │ ▼ Conversion Settings:                       │
 │   Target Material [ Universal Material   ▼ ] │
@@ -46,14 +49,16 @@ Once installed, press `N` in the 3D Viewport or Shader Editor to open the sideba
 │   Level of Detail [ 2048x2048            ▼ ] │
 │   Mid Level       <────────[ 0.50 ]────────> │
 │                                              │
-│ ▼ Material Update Tools:                     │
-│   [ 🖌️ Update Selected Material            ] │
-│   [ 🌍 Update All Materials                ] │
-│                                              │
 │ ▼ Utilities:                                 │
 │   [ 👁️ Preview Node in Viewport           ] │
 │   [ 🆕 Create Basic Material              ] │
 │   [ 🔗 Auto-Connect Textures              ] │
+│                                              │
+│ ▼ Last Conversion Report:                    │
+│   [ ℹ️ Materials Converted: 10             ] │
+│   [ 🗃️ Nodes Translated: 40               ] │
+│   Warnings:                                  │
+│   • [MatName] Unsupported: NodeName          │
 └──────────────────────────────────────────────┘
 ```
 
@@ -102,11 +107,28 @@ A quick breakdown of every setting in the panel so you know exactly what to clic
 
 ### 5️⃣ Material Update Tools
 ```text
-  ▼ Material Update Tools:                     
+  ▼ Albedo Gamma & Update Tools:               
+    Albedo Gamma    <────────[ 2.20 ]────────> 
     [ 🖌️ Update Selected Material            ] 
     [ 🌍 Update All Materials                ] 
 ```
-*   **What it does:** If you realize your materials look washed out *after* converting, you don't need to click Convert again. Just change the `Albedo Gamma` slider above, and click one of these buttons to instantly push the new gamma value to your existing Octane textures.
+*   **What it does:** If you realize your materials look washed out *after* converting, you don't need to click Convert again. Just change the `Albedo Gamma` slider, and click one of these buttons to instantly push the new gamma value to your existing Octane textures. `Update All Materials` will update *every* converted material in your entire Blender scene!
+
+### 6️⃣ Revert to Cycles
+```text
+    [ ↺ Revert to Cycles                     ]
+```
+*   **What it does:** Accidentally converted a material or want to go back? This instantly swaps your active object (or all objects, depending on your Batch Mode) back to the original Cycles materials, keeping your workflow totally non-destructive.
+
+### 7️⃣ Last Conversion Report
+```text
+  ▼ Last Conversion Report:                    
+    [ ℹ️ Materials Converted: 10             ] 
+    [ 🗃️ Nodes Translated: 40               ] 
+    Warnings:                                  
+    • [MatName] Unsupported: NodeName          
+```
+*   **What it does:** Shows a summary of the most recent conversion. It tracks exactly how many materials were converted and how many nodes were translated. If any nodes were skipped or required a fallback, it lists them concisely by material and node type (e.g., `[Wood] Unsupported: RGBCurves`) so you can quickly find and fix them in the Shader Editor.
 
 ## ✨ Features
 
@@ -117,13 +139,12 @@ A quick breakdown of every setting in the panel so you know exactly what to clic
 | 🎬 **Driver Preservation** | Automatically transfers `#frame` expressions and animation drivers |
 | 🔗 **Link Reconstruction** | Rebuilds all node connections with 7-strategy socket matching |
 | 🪟 **Glass & Transmission** | Auto-detects transmission > 0.5 and configures specular mode |
-| 💡 **Emission** | Auto-inserts Octane TextureEmission nodes for proper light rendering |
+| 💡 **Emission** | Auto-inserts Octane TextureEmission nodes and perfectly scales Power (x100) |
 | 🌫️ **Volumetrics** | Maps Volume Absorption/Scatter directly to Octane Medium nodes |
 | 🗺️ **Normal & Bump** | Direct-connects normal map textures and translates bump heights |
-| 📦 **Batch Conversion** | Convert active object or entire scene in one click |
-| 🔄 **Smart Deduplication** | Caches converted materials across objects — no duplicate work |
-| 📐 **Scale Correction** | Adjusts procedural textures for real-world object scale |
-| 🧮 **Math & Color Logic** | Deep mapping for Math, Vector Math, Map Range, Mixes, and RGB curves |
+| 📦 **Batch Conversion** | Convert entire scenes with one click (now with native Progress Bars!) |
+| 🔄 **Safe Revert** | Non-destructive — instantly swap back to the original Cycles setup |
+| 🧮 **OSL Math Precision** | Flawless translation of Math/VectorMath/Mix nodes via hidden Octane OSL Wrappers |
 
 ---
 

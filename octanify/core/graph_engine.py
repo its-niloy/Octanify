@@ -112,6 +112,13 @@ class GraphEngine:
 
             bl_id = info.bl_idname
 
+            if bl_id == "ShaderNodeMix":
+                data_type = info.properties.get("data_type", "FLOAT")
+                if data_type == "FLOAT":
+                    bl_id = "ShaderNodeMixFloat"
+                elif data_type == "VECTOR":
+                    bl_id = "ShaderNodeMixFloat3"
+
             # Skip nodes that are handled separately or are passthrough
             if bl_id in SKIP_TYPES:
                 continue
@@ -149,15 +156,20 @@ class GraphEngine:
 
             # Standard creation through registry
             new_node = create_octane_node(target_tree, bl_id, label=info.label)
+            
             if new_node is not None:
                 new_node.location = info.location
                 node_map[node_name] = new_node
+                
+                from .report import report_data
+                report_data.nodes_translated += 1
             else:
-                log.warning(
-                    "Skipping unsupported node '%s' (%s) — creating fallback",
-                    node_name, bl_id,
-                )
-                # Create a fallback RGB node so links don't break completely
+                # Fallback node creation
+                from .report import report_data
+                mat_name = target_tree.name.replace('_OCTANE', '')
+                short_type = info.bl_idname.replace('ShaderNode', '')
+                report_data.add_warning(f"[{mat_name}] Unsupported: {short_type}")
+                
                 try:
                     fallback = target_tree.nodes.new("ShaderNodeOctRGBColorTex")
                     fallback.label = f"[UNSUPPORTED] {info.label}"
@@ -172,8 +184,6 @@ class GraphEngine:
                         fallback.location = info.location
                         node_map[node_name] = fallback
                     except Exception:
-                        log.error(
-                            "Cannot create fallback node for '%s'", node_name
-                        )
+                        log.error("Cannot create fallback node for '%s'", node_name)
 
         return node_map

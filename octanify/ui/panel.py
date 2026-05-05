@@ -27,6 +27,8 @@ class OCTANIFY_PT_main_panel(bpy.types.Panel):
         col = box.column(align=True)
         col.scale_y = 1.4
         col.operator("octanify.convert", text="Convert to Octane", icon="SHADING_RENDERED")
+        col.separator(factor=0.3)
+        col.operator("octanify.revert_material", text="Revert to Cycles", icon="LOOP_BACK")
 
         layout.separator(factor=0.5)
 
@@ -38,11 +40,23 @@ class OCTANIFY_PT_main_panel(bpy.types.Panel):
 
         layout.separator(factor=0.5)
 
-        # ── Albedo gamma ──────────────────────────────────────────────
+        # ── Albedo gamma & Update Tools ───────────────────────────────
         box = layout.box()
         box.label(text="Albedo Gamma Control:", icon="COLOR")
         col = box.column(align=True)
         col.prop(scene, "octanify_albedo_gamma", slider=True)
+        col.separator(factor=0.5)
+        col.operator(
+            "octanify.update_selected_gamma",
+            text="Update Selected Material",
+            icon="MATERIAL",
+        )
+        col.separator(factor=0.3)
+        col.operator(
+            "octanify.update_all_gamma",
+            text="Update All Materials",
+            icon="WORLD",
+        )
 
         layout.separator(factor=0.5)
 
@@ -61,45 +75,37 @@ class OCTANIFY_PT_main_panel(bpy.types.Panel):
 
         layout.separator(factor=0.5)
 
-        # ── Update tools ──────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Material Update Tools:", icon="FILE_REFRESH")
-        col = box.column(align=True)
-        col.operator(
-            "octanify.update_selected_gamma",
-            text="Update Selected Material",
-            icon="MATERIAL",
-        )
-        col.separator(factor=0.3)
-        col.operator(
-            "octanify.update_all_gamma",
-            text="Update All Materials",
-            icon="WORLD",
-        )
-
-        layout.separator(factor=0.5)
-
         # ── Utilities ─────────────────────────────────────────────────
         box = layout.box()
         box.label(text="Utilities:", icon="TOOL_SETTINGS")
         col = box.column(align=True)
-        col.operator(
-            "octanify.preview_node_viewport",
-            text="Preview Node in Viewport",
-            icon="RESTRICT_VIEW_OFF",
-        )
+        col.operator("octanify.preview_node_viewport", text="Preview Node in Viewport", icon="RESTRICT_VIEW_OFF")
         col.separator(factor=0.3)
-        col.operator(
-            "octanify.create_basic_material",
-            text="Create Basic Material",
-            icon="MATERIAL_DATA",
-        )
+        col.operator("octanify.create_basic_material", text="Create Basic Material", icon="MATERIAL")
         col.separator(factor=0.3)
-        col.operator(
-            "octanify.auto_connect_textures",
-            text="Auto-Connect Textures",
-            icon="LINKED",
-        )
+        col.operator("octanify.auto_connect_textures", text="Auto-Connect Textures", icon="LINKED")
+
+        layout.separator(factor=0.5)
+
+        # ── Conversion Report ─────────────────────────────────────────
+        from ..core.report import report_data
+        if report_data.materials_converted > 0:
+            box = layout.box()
+            box.label(text="Last Conversion Report:", icon="INFO")
+            col = box.column(align=True)
+            col.label(text=f"Materials Converted: {report_data.materials_converted}", icon="MATERIAL")
+            col.label(text=f"Nodes Translated: {report_data.nodes_translated}", icon="NODETREE")
+            
+            if report_data.warnings:
+                box.separator(factor=0.5)
+                box.label(text="Warnings:", icon="ERROR")
+                warn_col = box.column(align=True)
+                for w in report_data.warnings[:5]:
+                    warn_col.label(text=w, icon="DOT")
+                if len(report_data.warnings) > 5:
+                    warn_col.label(text=f"...and {len(report_data.warnings) - 5} more")
+            
+            layout.separator(factor=0.5)
 
 
 class OCTANIFY_PT_shader_panel(bpy.types.Panel):

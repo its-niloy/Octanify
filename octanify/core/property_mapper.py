@@ -18,6 +18,30 @@ if TYPE_CHECKING:
 
 log = get_logger()
 
+MIX_BLEND_TYPE_MAP = {
+    "MIX": "Mix", "DARKEN": "Darken", "MULTIPLY": "Multiply", "BURN": "Burn",
+    "LIGHTEN": "Lighten", "SCREEN": "Screen", "DODGE": "Dodge", "ADD": "Add",
+    "OVERLAY": "Overlay", "SOFT_LIGHT": "Soft Light", "LINEAR_LIGHT": "Linear Light",
+    "DIFFERENCE": "Difference", "EXCLUSION": "Exclusion", "SUBTRACT": "Subtract",
+    "DIVIDE": "Divide", "HUE": "Hue", "SATURATION": "Saturation", "COLOR": "Color",
+    "VALUE": "Value"
+}
+
+MATH_TYPE_MAP = {
+    "ADD": "Add", "SUBTRACT": "Subtract", "MULTIPLY": "Multiply", "DIVIDE": "Divide",
+    "MULTIPLY_ADD": "Multiply Add", "POWER": "Power", "LOGARITHM": "Logarithm",
+    "SQRT": "Square Root", "INV_SQRT": "Inverse Square Root", "ABSOLUTE": "Absolute",
+    "EXPONENT": "Exponent", "MINIMUM": "Minimum", "MAXIMUM": "Maximum",
+    "LESS_THAN": "Less Than", "GREATER_THAN": "Greater Than", "SIGN": "Sign",
+    "COMPARE": "Compare", "SMOOTH_MIN": "Smooth min", "SMOOTH_MAX": "Smooth max",
+    "ROUND": "Round", "FLOOR": "Floor", "CEIL": "Ceil", "TRUNC": "Truncate",
+    "FRACT": "Fraction", "MODULO": "Truncated Modulo", "FLOORED_MODULO": "Floored Modulo",
+    "WRAP": "Wrap", "SNAP": "Snap", "PINGPONG": "Pingpong", "SINE": "Sine",
+    "COSINE": "Cosine", "TANGENT": "Tangent", "ARCSINE": "Arcsine",
+    "ARCCOSINE": "Arccosine", "ARCTANGENT": "Arctangent", "ARCTAN2": "Arctan2",
+    "SINH": "Hyperbolic Sine", "COSH": "Hyperbolic Cosine", "TANH": "Hyperbolic Tangent",
+    "RADIANS": "Radians", "DEGREES": "Degrees"
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -154,7 +178,7 @@ def _transfer_principled(info: "NodeInfo", node: "bpy.types.Node") -> None:
     if em_color is not None:
         _set_input(node, ["Emission", "Emission color"], em_color)
     if em_strength is not None:
-        _set_input(node, ["Emission power", "Emission weight"], em_strength)
+        _set_input(node, ["Emission power", "Emission weight", "Power"], em_strength * 100.0)
         # Enable surface brightness if emission detected
         if isinstance(em_strength, (int, float)) and em_strength > 0.0:
             _set_prop(node, "surface_brightness", True)
@@ -221,7 +245,7 @@ def _transfer_emission(info: "NodeInfo", node: "bpy.types.Node") -> None:
     strength = _get_input_value(info, "Strength", 1.0)
     _set_input(node, ["Diffuse", "Albedo color", "Albedo"], (0.0, 0.0, 0.0, 1.0))
     _set_input(node, ["Emission", "Emission color"], color)
-    _set_input(node, ["Emission power", "Power"], strength)
+    _set_input(node, ["Emission power", "Power"], strength * 100.0)
     _set_prop(node, "surface_brightness", True)
 
 
@@ -272,12 +296,23 @@ def _transfer_image_texture(info: "NodeInfo", node: "bpy.types.Node") -> None:
     
     if is_linear:
         # Set gamma to 1.0 (linear)
-        _set_input(node, ["Gamma", "Power", "Legacy gamma"], 1.0)
+        _set_input(node, ["Legacy gamma", "Gamma", "Power"], 1.0)
         _set_prop(node, "gamma", 1.0)
     else:
         # sRGB → gamma 2.2
-        _set_input(node, ["Gamma", "Power", "Legacy gamma"], 2.2)
+        _set_input(node, ["Legacy gamma", "Gamma", "Power"], 2.2)
         _set_prop(node, "gamma", 2.2)
+
+    extension = info.properties.get("extension", "REPEAT")
+    if extension == "EXTEND":
+        _set_input(node, ["Border mode (U)"], "Clamp value")
+        _set_input(node, ["Border mode (V)"], "Clamp value")
+    elif extension == "CLIP":
+        _set_input(node, ["Border mode (U)"], "Black color")
+        _set_input(node, ["Border mode (V)"], "Black color")
+    else:
+        _set_input(node, ["Border mode (U)"], "Wrap around")
+        _set_input(node, ["Border mode (V)"], "Wrap around")
 
     # Projection
     proj = info.properties.get("projection", "FLAT")
@@ -310,22 +345,23 @@ def _transfer_bump(info: "NodeInfo", node: "bpy.types.Node") -> None:
 def _transfer_displacement(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Displacement → Octane Displacement."""
     import bpy
-    _set_input(node, ["Amount", "Height"], _get_input_value(info, "Scale", 1.0))
+    _set_input(node, ["Height", "Amount"], _get_input_value(info, "Scale", 1.0))
     midlevel = _get_input_value(info, "Midlevel", 0.5)
-    _set_input(node, ["Mid Level", "Mid level"], midlevel)
+    _set_input(node, ["Mid level", "Mid Level"], midlevel)
 
     try:
         scene = bpy.context.scene
         disp_mode = getattr(scene, "octanify_disp_mode", "TEXTURE")
         if disp_mode == "TEXTURE":
-            lod_value = int(getattr(scene, "octanify_disp_level_of_detail", "3"))
-            # Try as node property first (Octane uses this as an enum attribute)
-            if not _set_prop(node, "level_of_detail", lod_value):
-                _set_input(node, ["Level of detail"], float(lod_value))
+            lod_value = getattr(scene, "octanify_disp_level_of_detail", "1024x1024")
+            if lod_value.isdigit(): # Legacy int fallback
+                lod_dict = {"8": "256x256", "9": "512x512", "10": "1024x1024", "11": "2048x2048", "12": "4096x4096", "13": "8192x8192", "14": "16384x16384"}
+                lod_value = lod_dict.get(lod_value, "1024x1024")
+            _set_input(node, ["Level of detail"], lod_value)
         
         pref_mid = getattr(scene, "octanify_disp_mid_level", 0.5)
         if pref_mid != 0.5:
-            _set_input(node, ["Mid Level", "Mid level"], pref_mid)
+            _set_input(node, ["Mid level", "Mid Level"], pref_mid)
     except Exception:
         pass
 
@@ -342,60 +378,55 @@ def _transfer_mapping(info: "NodeInfo", node: "bpy.types.Node") -> None:
 
 
 def _transfer_mix_rgb(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """MixRGB → Octane Mix Texture (or specialised variant)."""
+    """MixRGB → Octane CyclesMixColorNodeWrapper."""
     fac = _get_input_value(info, "Fac")
     if fac is not None:
-        _set_input(node, ["Amount", "Factor"], fac)
+        _set_input(node, ["Factor", "Amount"], fac)
 
     c1 = _get_input_value(info, "Color1")
     if c1 is not None:
-        _set_input(node, ["Texture1", "Color1", "Input1"], c1)
+        _set_input(node, ["A", "Texture1", "Color1", "Input1"], c1)
 
     c2 = _get_input_value(info, "Color2")
     if c2 is not None:
-        _set_input(node, ["Texture2", "Color2", "Input2"], c2)
+        _set_input(node, ["B", "Texture2", "Color2", "Input2"], c2)
 
-    # Use clamp
     use_clamp = info.properties.get("use_clamp", False)
-    _set_prop(node, "use_clamp", use_clamp)
+    _set_input(node, ["Clamp Result(Int)"], 1 if use_clamp else 0)
+    _set_input(node, ["Clamp Result"], use_clamp)
     
-    # Blend Type — try multiple attribute names for Wrapper node compatibility
     blend_type = info.properties.get("blend_type", "MIX")
-    if not _set_prop(node, "blend_type", blend_type):
-        if not _set_prop(node, "blendType", blend_type):
-            _set_prop(node, "operation", blend_type)
+    oct_blend_type = MIX_BLEND_TYPE_MAP.get(blend_type, "Mix")
+    _set_input(node, ["Blend Type"], oct_blend_type)
 
 
 def _transfer_mix(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """Blender 4+ Mix node → Octane Mix Texture."""
+    """Blender 4+ Mix node → Octane Mix Wrappers."""
     fac = _get_input_value(info, "Factor")
     if fac is None:
         fac = _get_input_value(info, "Fac")
     if fac is not None:
-        _set_input(node, ["Amount", "Factor"], fac)
+        _set_input(node, ["Factor", "Amount"], fac)
 
     a = _get_input_value(info, "A")
     if a is not None:
-        _set_input(node, ["Texture1", "Color1", "Input1"], a)
+        _set_input(node, ["A", "Texture1", "Color1", "Input1"], a)
 
     b = _get_input_value(info, "B")
     if b is not None:
-        _set_input(node, ["Texture2", "Color2", "Input2"], b)
+        _set_input(node, ["B", "Texture2", "Color2", "Input2"], b)
 
-    # Blend Type — try multiple attribute names for Wrapper node compatibility
     blend_type = info.properties.get("blend_type", "MIX")
-    if not _set_prop(node, "blend_type", blend_type):
-        if not _set_prop(node, "blendType", blend_type):
-            _set_prop(node, "operation", blend_type)
-    
-    data_type = info.properties.get("data_type", "FLOAT")
-    _set_prop(node, "data_type", data_type)
+    oct_blend_type = MIX_BLEND_TYPE_MAP.get(blend_type, "Mix")
+    _set_input(node, ["Blend Type"], oct_blend_type)
     
     clamp_result = info.properties.get("clamp_result", False)
-    _set_prop(node, "clamp_result", clamp_result)
+    _set_input(node, ["Clamp Result(Int)"], 1 if clamp_result else 0)
+    _set_input(node, ["Clamp Result"], clamp_result)
     
     clamp_factor = info.properties.get("clamp_factor", False)
-    _set_prop(node, "clamp_factor", clamp_factor)
+    _set_input(node, ["Clamp Factor(Int)"], 1 if clamp_factor else 0)
+    _set_input(node, ["Clamp Factor"], clamp_factor)
 
 
 def _transfer_invert(info: "NodeInfo", node: "bpy.types.Node") -> None:
@@ -426,27 +457,37 @@ def _transfer_gamma_node(info: "NodeInfo", node: "bpy.types.Node") -> None:
 
 
 def _transfer_math(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """Math → Octane Float Math."""
+    """Math → Octane Math Wrapper."""
     op = info.properties.get("operation", "ADD")
-    oct_op = MATH_OPERATION_MAP.get(op, "ADD")
-    _set_prop(node, "operation", oct_op)
+    oct_op = MATH_TYPE_MAP.get(op, "Add")
+    _set_input(node, ["Type", "Math Type"], oct_op)
+    # Native math fallback
+    _set_prop(node, "operation", MATH_OPERATION_MAP.get(op, "ADD"))
 
     v1 = _get_input_value(info, "Value")
     if v1 is not None:
-        _set_input(node, ["Input1", "Value", "A"], v1)
+        _set_input(node, ["Value", "Value1", "Input1", "Base", "Degrees", "Radians", "A"], v1)
 
-    # Math node has two Value sockets; the second one stored as Value_001
     v2 = _get_input_value(info, "Value_001")
     if v2 is None:
-        # Try by index
         vals = [v for k, v in info.inputs.items() if k.startswith("Value")]
         if len(vals) > 1:
             v2 = vals[1]
     if v2 is not None:
-        _set_input(node, ["Input2", "Value2", "B"], v2)
+        _set_input(node, ["Value2", "Input2", "Exponent", "Multiplier", "Threshold", "Scale", "Increment", "Max", "B"], v2)
+
+    v3 = _get_input_value(info, "Value_002")
+    if v3 is None:
+        vals = [v for k, v in info.inputs.items() if k.startswith("Value")]
+        if len(vals) > 2:
+            v3 = vals[2]
+    if v3 is not None:
+        _set_input(node, ["Value3", "Addend", "Epsilon", "Distance", "Min"], v3)
 
     clamp = info.properties.get("use_clamp", False)
-    _set_prop(node, "use_clamp", clamp)
+    _set_input(node, ["Clamp(Int)"], 1 if clamp else 0)
+    _set_input(node, ["Clamp"], clamp)
+
 
 
 def _transfer_map_range(info: "NodeInfo", node: "bpy.types.Node") -> None:

@@ -747,6 +747,11 @@ def convert_material(
         return None
 
     mat_name = mat.name
+    
+    # Prevent converting an already converted material
+    if mat_name.endswith("_OCTANE"):
+        log.info("Material '%s' is already an Octane material, skipping", mat_name)
+        return mat
 
     # Check cache
     if _cache.has_material(mat_name):
@@ -814,6 +819,9 @@ def convert_material(
     # 14. Register in cache
     _cache.register_material(mat_name, new_mat.name)
 
+    from .report import report_data
+    report_data.materials_converted += 1
+
     log.info("Successfully converted '%s' → '%s'", mat_name, new_mat.name)
     return new_mat
 
@@ -851,10 +859,18 @@ def convert_scene_materials(
     reset_cache()
     converted = []
 
-    for obj in bpy.context.scene.objects:
-        if not hasattr(obj, "material_slots"):
-            continue
+    # Filter objects with material slots
+    objects = [obj for obj in bpy.context.scene.objects if hasattr(obj, "material_slots")]
+    total = len(objects)
+
+    wm = bpy.context.window_manager
+    wm.progress_begin(0, max(1, total))
+
+    for i, obj in enumerate(objects):
         results = convert_object_materials(obj, gamma_value=gamma_value)
         converted.extend(results)
+        wm.progress_update(i)
+
+    wm.progress_end()
 
     return converted

@@ -18,7 +18,7 @@ from __future__ import annotations
 bl_info = {
     "name": "Octanify",
     "author": "Niloy Bhowmick",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Octanify",
     "description": "Convert Cycles materials to Octane materials with one click",

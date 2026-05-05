@@ -40,9 +40,11 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
         return True
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        scene = context.scene
-        batch_mode = scene.octanify_batch_mode
-        gamma = scene.octanify_albedo_gamma
+        batch_mode = context.scene.octanify_batch_mode
+        gamma = context.scene.octanify_albedo_gamma
+        
+        from ..core.report import report_data
+        report_data.clear()
 
         try:
             if batch_mode == "ACTIVE":
@@ -128,16 +130,13 @@ class OCTANIFY_OT_update_all_gamma(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        obj = context.active_object
-        return obj is not None and hasattr(obj, "material_slots")
+        return True
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         gamma = context.scene.octanify_albedo_gamma
-        obj = context.active_object
-        materials = [
-            slot.material for slot in obj.material_slots
-            if slot.material is not None
-        ]
+        
+        # Only target materials that use nodes
+        materials = [mat for mat in bpy.data.materials if mat.use_nodes]
 
         try:
             count = update_all_materials_gamma(materials, gamma)
@@ -259,6 +258,56 @@ class OCTANIFY_OT_preview_node_viewport(bpy.types.Operator):
 
         self.report({"INFO"}, f"Previewing {active_node.name}")
         return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Utility: Revert to Cycles
+# ---------------------------------------------------------------------------
+
+class OCTANIFY_OT_revert_material(bpy.types.Operator):
+    """Revert materials to their original Cycles versions"""
+
+    bl_idname = "octanify.revert_material"
+    bl_label = "Revert to Cycles"
+    bl_description = "Restore the original Cycles materials (respects Batch Mode)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        if context.scene.octanify_batch_mode == "ACTIVE":
+            return context.active_object is not None
+        return True
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        batch_mode = context.scene.octanify_batch_mode
+        
+        objects = []
+        if batch_mode == "ACTIVE":
+            if context.active_object:
+                objects.append(context.active_object)
+        else:
+            objects = list(context.scene.objects)
+            
+        reverted = 0
+        for obj in objects:
+            if not hasattr(obj, "material_slots"):
+                continue
+            for slot in obj.material_slots:
+                if slot.material and slot.material.name.endswith("_OCTANE"):
+                    orig_name = slot.material.name.replace("_OCTANE", "")
+                    orig_mat = bpy.data.materials.get(orig_name)
+                    if orig_mat:
+                        slot.material = orig_mat
+                        reverted += 1
+        
+        if batch_mode == "ACTIVE" and objects:
+            self.report({"INFO"}, f"Reverted {reverted} material(s) on '{objects[0].name}'")
+        else:
+            self.report({"INFO"}, f"Reverted {reverted} material(s) across all objects")
+            
+        return {"FINISHED"}
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +498,7 @@ classes = (
     OCTANIFY_OT_preview_node_viewport,
     OCTANIFY_OT_create_basic_material,
     OCTANIFY_OT_auto_connect_textures,
+    OCTANIFY_OT_revert_material,
 )
 
 def register() -> None:
