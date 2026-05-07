@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">⚡ Octanify</h1>
+  <h1 align="center">Octanify</h1>
   <p align="center">
     <strong>One-click Cycles → Octane material conversion for Blender</strong>
   </p>
