@@ -21,7 +21,7 @@
 
 ---
 
-## 🖥️ The Interface
+## <a id="the-interface"></a>🖥️ The Interface
 
 Once installed, press `N` in the 3D Viewport or Shader Editor to open the sidebar and find the **Octanify** tab. It matches this layout perfectly:
 
@@ -130,7 +130,7 @@ A quick breakdown of every setting in the panel so you know exactly what to clic
 ```
 *   **What it does:** Shows a summary of the most recent conversion. It tracks exactly how many materials were converted and how many nodes were translated. If any nodes were skipped or required a fallback, it lists them concisely by material and node type (e.g., `[Wood] Unsupported: RGBCurves`) so you can quickly find and fix them in the Shader Editor.
 
-## ✨ Features
+## <a id="features"></a>✨ Features
 
 | Feature | Description |
 |---|---|
@@ -171,7 +171,7 @@ Octane requires specific gamma curves. Albedo/Color maps need `2.2`, while data 
 
 ---
 
-## 🛠️ Workflow Utilities
+## <a id="workflow-utilities"></a>🛠️ Workflow Utilities
 
 These buttons (located at the bottom of the panel) speed up your daily shader work:
 
@@ -207,7 +207,7 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
 
 ---
 
-## ⚙️ How It Works
+## <a id="how-it-works"></a>⚙️ How It Works
 
 ```text
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -232,7 +232,7 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
 
 ---
 
-## 🔌 Supported Nodes
+## <a id="supported-nodes"></a>🔌 Supported Nodes
 
 <details>
 <summary><strong>Shaders (15+ types)</strong></summary>
@@ -336,7 +336,7 @@ octanify/
 
 ---
 
-## 📥 Installation
+## <a id="installation"></a>📥 Installation
 
 ### Blender 4.2+ / 5.1+
 1. Download `octanify.zip`
