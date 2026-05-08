@@ -622,6 +622,26 @@ def convert_node_group(
         if n.bl_idname in ("NodeGroupInput", "NodeGroupOutput"):
             node_map[n.name] = n
 
+    # WEAKNESS 2 FIX: Validate I/O socket counts match the analysis.
+    # If socket count/order changed during conversion, link rebuild will
+    # silently connect wrong sockets. This warning catches the mismatch.
+    from .report import report_data
+    for n in new_tree.nodes:
+        if n.bl_idname == "NodeGroupInput":
+            orig_info = analysis.nodes.get(n.name)
+            if orig_info and len(n.outputs) != len(orig_info.outputs):
+                report_data.add_warning(
+                    f"[Group: {tree_name}] GroupInput socket count mismatch "
+                    f"(expected {len(orig_info.outputs)}, got {len(n.outputs)}) — links may be wrong"
+                )
+        if n.bl_idname == "NodeGroupOutput":
+            orig_info = analysis.nodes.get(n.name)
+            if orig_info and len(n.inputs) != len(orig_info.inputs):
+                report_data.add_warning(
+                    f"[Group: {tree_name}] GroupOutput socket count mismatch "
+                    f"(expected {len(orig_info.inputs)}, got {len(n.inputs)}) — links may be wrong"
+                )
+
     for node_name, oct_node in node_map.items():
         if oct_node.bl_idname in ("NodeGroupInput", "NodeGroupOutput"):
             continue

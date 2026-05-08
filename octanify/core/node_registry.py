@@ -349,16 +349,45 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
     "ShaderNodeVolumeInfo": [
         "ShaderNodeOctFloatTex",
     ],
+
+    # ── Channel Split / Combine ──────────────────────────────────────────
+    # BUG 1 FIX: These were previously transparent/passthrough, which broke
+    # packed texture channels. Now mapped to Octane equivalents or ColorCorrection fallback.
+    "ShaderNodeSeparateColor": [
+        "OctaneSeparateColor",
+        "ShaderNodeOctColorCorrectionTex",
+        "OctaneColorCorrection",
+    ],
+    "ShaderNodeSeparateRGB": [
+        "OctaneSeparateColor",
+        "ShaderNodeOctColorCorrectionTex",
+        "OctaneColorCorrection",
+    ],
+    "ShaderNodeSeparateXYZ": [
+        "OctaneSeparateXYZ",
+        "ShaderNodeOctColorCorrectionTex",
+        "OctaneColorCorrection",
+    ],
+    "ShaderNodeCombineColor": [
+        "OctaneCombineColor",
+        "ShaderNodeOctAddTex",
+        "OctaneAddTexture",
+    ],
+    "ShaderNodeCombineRGB": [
+        "OctaneCombineColor",
+        "ShaderNodeOctAddTex",
+        "OctaneAddTexture",
+    ],
+    "ShaderNodeCombineXYZ": [
+        "OctaneCombineXYZ",
+        "ShaderNodeOctAddTex",
+        "OctaneAddTexture",
+    ],
 }
 
 # Nodes that are passed through (logic handled inline, no 1:1 node creation)
+# BUG 1 FIX: Separate*/Combine* removed — they now get proper Octane nodes
 PASSTHROUGH_TYPES: set[str] = {
-    "ShaderNodeSeparateColor",
-    "ShaderNodeSeparateRGB",
-    "ShaderNodeSeparateXYZ",
-    "ShaderNodeCombineColor",
-    "ShaderNodeCombineRGB",
-    "ShaderNodeCombineXYZ",
     "ShaderNodeNewGeometry",
     "ShaderNodeLightPath",
     "ShaderNodeOutputMaterial",
@@ -728,6 +757,32 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Emission Color":   ["Emission", "Emission color"],
         "Emission Strength":["Emission power", "Power"],
     },
+
+    # ── Channel Split / Combine (BUG 1 FIX) ─────────────────────────────
+    "ShaderNodeSeparateColor": {
+        "Color": ["Texture", "Input", "Color"],
+    },
+    "ShaderNodeSeparateRGB": {
+        "Image": ["Texture", "Input", "Color"],
+    },
+    "ShaderNodeSeparateXYZ": {
+        "Vector": ["Texture", "Input", "Color"],
+    },
+    "ShaderNodeCombineColor": {
+        "Red":   ["Texture1", "Input1", "Color1", "R"],
+        "Green": ["Texture2", "Input2", "Color2", "G"],
+        "Blue":  ["Texture3", "Input3", "B"],
+    },
+    "ShaderNodeCombineRGB": {
+        "R": ["Texture1", "Input1", "Color1", "R"],
+        "G": ["Texture2", "Input2", "Color2", "G"],
+        "B": ["Texture3", "Input3", "B"],
+    },
+    "ShaderNodeCombineXYZ": {
+        "X": ["Texture1", "Input1", "Color1", "X"],
+        "Y": ["Texture2", "Input2", "Color2", "Y"],
+        "Z": ["Texture3", "Input3", "Z"],
+    },
 }
 
 OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
@@ -928,6 +983,32 @@ OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
     },
     "ShaderNodeVolumePrincipled": {
         "Volume": ["OutMedium", "Medium out", "Output"],
+    },
+
+    # ── Channel Split / Combine (BUG 1 FIX) ─────────────────────────────
+    "ShaderNodeSeparateColor": {
+        "Red":   ["OutTex", "Texture out", "Output", "R"],
+        "Green": ["OutTex", "Texture out", "Output", "G"],
+        "Blue":  ["OutTex", "Texture out", "Output", "B"],
+    },
+    "ShaderNodeSeparateRGB": {
+        "R": ["OutTex", "Texture out", "Output", "R"],
+        "G": ["OutTex", "Texture out", "Output", "G"],
+        "B": ["OutTex", "Texture out", "Output", "B"],
+    },
+    "ShaderNodeSeparateXYZ": {
+        "X": ["OutTex", "Texture out", "Output", "X"],
+        "Y": ["OutTex", "Texture out", "Output", "Y"],
+        "Z": ["OutTex", "Texture out", "Output", "Z"],
+    },
+    "ShaderNodeCombineColor": {
+        "Color": ["OutTex", "Texture out", "Output"],
+    },
+    "ShaderNodeCombineRGB": {
+        "Image": ["OutTex", "Texture out", "Output"],
+    },
+    "ShaderNodeCombineXYZ": {
+        "Vector": ["OutTex", "Texture out", "Output"],
     },
 }
 

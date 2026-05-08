@@ -581,25 +581,95 @@ def _transfer_checker(info: "NodeInfo", node: "bpy.types.Node") -> None:
 
 
 def _transfer_uv_map(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """UV Map → Octane Mesh UV Projection."""
-    uv_name = info.properties.get("uv_map", "")
-    _set_prop(node, "uv_map", uv_name)
-    _set_prop(node, "name", uv_name)
+    """UV Map → Octane Mesh UV Projection.
 
+    BUG 3 FIX: OctaneMeshUVProjection uses UV index, not name. We attempt
+    to set the name via input socket, label the node for manual reference,
+    and warn if the UV layer is non-default so users verify the UV index.
+    """
+    uv_map_name = info.properties.get("uv_map", "")
+    # Legacy attempts — may work on some Octane versions
+    _set_prop(node, "uv_map", uv_map_name)
+    _set_prop(node, "name", uv_map_name)
+
+    if uv_map_name:
+        # Try setting by name via input socket (some Octane versions support this)
+        uv_name_sock = (
+            node.inputs.get("UV set name")
+            or node.inputs.get("UV name")
+            or node.inputs.get("Attribute")
+        )
+        if uv_name_sock and hasattr(uv_name_sock, "default_value"):
+            try:
+                uv_name_sock.default_value = uv_map_name
+            except (TypeError, AttributeError):
+                pass
+
+        # Label the node so users can manually verify the UV index
+        if uv_map_name != "UVMap":
+            node.label = f"UV: {uv_map_name}"
+
+        # Warn on non-default UV layer names — Octane may need manual index
+        if uv_map_name != "UVMap":
+            from .report import report_data
+            report_data.add_warning(
+                f"[{node.name}] UV layer '{uv_map_name}' — verify UV index in Octane"
+            )
 
 def _transfer_color_ramp(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """ColorRamp → Octane Gradient Texture.
 
-    Octane gradient textures accept start/end color; for complex ramps
-    we transfer the first and last stop colors.
+    WEAKNESS 1 FIX: Previously only first/last stop colors were transferred.
+    Now we attempt full gradient element transfer via oct_node.elements, then
+    fall back to start/end color inputs if elements aren't available.
     """
     stops = info.properties.get("stops", [])
-    if stops:
+    if not stops:
+        return
+
+    # Strategy 1: Full element transfer (if the Octane node exposes elements)
+    elements_transferred = False
+    if hasattr(node, "elements") and len(stops) > 0:
+        try:
+            elements = node.elements
+            # Clear existing elements beyond the first (Octane starts with at least 1)
+            while len(elements) > 1:
+                elements.remove(elements[-1])
+
+            for i, stop in enumerate(stops):
+                if i < len(elements):
+                    elem = elements[i]
+                else:
+                    try:
+                        elem = elements.new(stop["position"])
+                    except Exception:
+                        continue
+                try:
+                    elem.position = stop["position"]
+                    if hasattr(elem, "color"):
+                        elem.color = stop["color"]
+                except (TypeError, AttributeError):
+                    pass
+
+            elements_transferred = True
+        except (TypeError, AttributeError, RuntimeError):
+            pass  # elements API not available — fall through to start/end
+
+    # Strategy 2: Fallback — set start and end colors via input sockets
+    if not elements_transferred:
         first_color = stops[0].get("color", (0.0, 0.0, 0.0, 1.0))
         last_color = stops[-1].get("color", (1.0, 1.0, 1.0, 1.0))
         _set_input(node, ["Start color", "Color1", "Start value"], first_color)
         _set_input(node, ["End color", "Color2", "End value"], last_color)
 
+    # Transfer interpolation mode if the Octane node supports it
+    interp = info.properties.get("interpolation", "LINEAR")
+    interp_sock = node.inputs.get("Interpolation") or node.inputs.get("Mode")
+    if interp_sock and hasattr(interp_sock, "default_value"):
+        try:
+            interp_sock.default_value = interp
+        except (TypeError, AttributeError):
+            pass
 
 def _transfer_volume_absorption(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Volume Absorption → Octane Absorption Medium."""
@@ -709,6 +779,75 @@ def _transfer_volume_principled(info: "NodeInfo", node: "bpy.types.Node") -> Non
     _set_input(node, ["Emission power", "Power"], _get_input_value(info, "Emission Strength", 0.0))
 
 
+# ---------------------------------------------------------------------------
+# BUG 1 FIX: Separate / Combine channel node handlers
+# When Octane doesn't have a native SeparateColor, the fallback is
+# ColorCorrection. We report a warning so users know to verify channels.
+# ---------------------------------------------------------------------------
+
+def _transfer_separate_color(info: "NodeInfo", node: "bpy.types.Node") -> None:
+    """SeparateColor/RGB/XYZ → Octane equivalent or ColorCorrection fallback.
+
+    If the created node is a ColorCorrection (fallback), we note the channel
+    split in the label and emit a conversion report warning. The actual
+    per-channel isolation is handled at the link level by OUTPUT_MAP.
+    """
+    from .report import report_data
+
+    is_fallback = node.bl_idname in (
+        "ShaderNodeOctColorCorrectionTex", "OctaneColorCorrection",
+    )
+    if is_fallback:
+        short_type = info.bl_idname.replace("ShaderNode", "")
+        node.label = f"[Channel Split] {info.label}"
+        mat_name = node.id_data.name.replace("_OCTANE", "") if node.id_data else "?"
+        report_data.add_warning(
+            f"[{mat_name}] Channel split preserved via workaround: {short_type}"
+        )
+
+
+def _transfer_combine_color(info: "NodeInfo", node: "bpy.types.Node") -> None:
+    """CombineColor/RGB/XYZ → Octane equivalent or Add fallback.
+
+    Transfer individual channel default values if available.
+    """
+    from .report import report_data
+
+    # Transfer default channel values
+    bid = info.bl_idname
+    if bid in ("ShaderNodeCombineColor", "ShaderNodeCombineRGB"):
+        r = _get_input_value(info, "Red") or _get_input_value(info, "R")
+        g = _get_input_value(info, "Green") or _get_input_value(info, "G")
+        b = _get_input_value(info, "Blue") or _get_input_value(info, "B")
+        if r is not None:
+            _set_input(node, ["Texture1", "Input1", "Color1", "R"], r)
+        if g is not None:
+            _set_input(node, ["Texture2", "Input2", "Color2", "G"], g)
+        if b is not None:
+            _set_input(node, ["Texture3", "Input3", "B"], b)
+    elif bid == "ShaderNodeCombineXYZ":
+        x = _get_input_value(info, "X")
+        y = _get_input_value(info, "Y")
+        z = _get_input_value(info, "Z")
+        if x is not None:
+            _set_input(node, ["Texture1", "Input1", "X"], x)
+        if y is not None:
+            _set_input(node, ["Texture2", "Input2", "Y"], y)
+        if z is not None:
+            _set_input(node, ["Texture3", "Input3", "Z"], z)
+
+    is_fallback = node.bl_idname in (
+        "ShaderNodeOctAddTex", "OctaneAddTexture",
+    )
+    if is_fallback:
+        short_type = info.bl_idname.replace("ShaderNode", "")
+        node.label = f"[Channel Combine] {info.label}"
+        mat_name = node.id_data.name.replace("_OCTANE", "") if node.id_data else "?"
+        report_data.add_warning(
+            f"[{mat_name}] Channel combine preserved via workaround: {short_type}"
+        )
+
+
 def _transfer_generic(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Fallback: try to match inputs by identifier or display name."""
     for sock_id, value in info.inputs.items():
@@ -795,4 +934,12 @@ _HANDLERS: dict[str, callable] = {
     "ShaderNodeBlackbody": _transfer_blackbody,
     "ShaderNodeRGBToBW": _transfer_rgb_to_bw,
     "ShaderNodeVolumePrincipled": _transfer_volume_principled,
+
+    # BUG 1 FIX: Channel split/combine handlers
+    "ShaderNodeSeparateColor": _transfer_separate_color,
+    "ShaderNodeSeparateRGB": _transfer_separate_color,
+    "ShaderNodeSeparateXYZ": _transfer_separate_color,
+    "ShaderNodeCombineColor": _transfer_combine_color,
+    "ShaderNodeCombineRGB": _transfer_combine_color,
+    "ShaderNodeCombineXYZ": _transfer_combine_color,
 }

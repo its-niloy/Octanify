@@ -5,7 +5,7 @@ Walks a Cycles node tree and produces a structured analysis with:
 - Default value snapshots
 - Property snapshots (blend_type, operation, image, colorspace, etc.)
 - Flattened link list (reroutes resolved, duplicates removed)
-- Transparent node flattening (SeparateColor/RGB/XYZ pass through)
+- Transparent node flattening (Geometry/LightPath only)
 - Socket disambiguation via identifier for nodes with duplicate names
 - Pattern detection: glass, emission, volume, alpha, bump/normal
 """
@@ -83,14 +83,12 @@ class TreeAnalysis:
 # IMPORTANT: Only nodes that have NO Octane equivalent belong here.
 # Nodes like Math, Clamp, Invert, HueSat, BrightContrast, Gamma,
 # and RGBCurves have valid Octane mappings and MUST be analyzed normally.
+#
+# BUG 1 FIX: Separate*/Combine* were removed from here because making
+# them transparent caused _trace_transparent_source to return a single
+# upstream source for ALL output channels, destroying packed texture
+# channel identity (e.g., ORM maps: R=Roughness, G=Metallic, B=AO).
 _TRANSPARENT_TYPES: set[str] = {
-    # Channel split / combine nodes — no direct Octane equivalent
-    "ShaderNodeSeparateColor",
-    "ShaderNodeSeparateRGB",
-    "ShaderNodeSeparateXYZ",
-    "ShaderNodeCombineColor",
-    "ShaderNodeCombineRGB",
-    "ShaderNodeCombineXYZ",
     # Info nodes with no Octane equivalent
     "ShaderNodeNewGeometry",
     "ShaderNodeLightPath",
@@ -142,8 +140,7 @@ def _trace_transparent_source(
 ) -> tuple[bpy.types.Node, bpy.types.NodeSocket] | None:
     """Trace backward through a transparent node to find the real source.
 
-    For SeparateColor/RGB/XYZ: follow the single Color/Vector input backward.
-    For CombineColor/RGB/XYZ: follow the first connected input backward.
+    For Geometry/LightPath info nodes: follow the first connected input backward.
     """
     if not node.inputs:
         return None
@@ -207,6 +204,13 @@ _PROPERTY_KEYS: dict[str, list[str]] = {
     "ShaderNodeTexGabor": ["gabor_type"],
     "ShaderNodeVectorMath": ["operation"],
     "ShaderNodeGroup": ["node_tree"],
+    # BUG 1 FIX: Separate/Combine nodes now analyzed as regular nodes
+    "ShaderNodeSeparateColor": ["mode"],
+    "ShaderNodeCombineColor": ["mode"],
+    "ShaderNodeSeparateRGB": [],
+    "ShaderNodeCombineRGB": [],
+    "ShaderNodeSeparateXYZ": [],
+    "ShaderNodeCombineXYZ": [],
 }
 
 
@@ -319,13 +323,33 @@ def analyze_tree(node_tree: bpy.types.NodeTree) -> TreeAnalysis:
                     analysis.has_glass = True
                     analysis.transmission_weight = tw
 
+            # BUG 2 FIX: Also detect emission when driven by a texture link,
+            # not just a non-zero default_value. Without this, any Principled
+            # BSDF with a texture-driven emission silently loses it on convert.
             em_input = node.inputs.get("Emission Color")
-            em_str = node.inputs.get("Emission Strength")
+            em_str_input = node.inputs.get("Emission Strength")
             if em_input is not None:
+                has_em_link = len(em_input.links) > 0
                 em_col = getattr(em_input, "default_value", None)
-                if em_col is not None:
-                    if any(c > 0.0 for c in tuple(em_col)[:3]):
-                        analysis.has_emission = True
+                color_nonzero = (
+                    em_col is not None
+                    and any(c > 0.0 for c in tuple(em_col)[:3])
+                )
+
+                # Check emission strength > 0 or driven by a link
+                strength_nonzero = False
+                if em_str_input is not None:
+                    has_str_link = len(em_str_input.links) > 0
+                    str_val = getattr(em_str_input, "default_value", 0.0)
+                    strength_nonzero = (
+                        has_str_link
+                        or (str_val is not None and float(str_val) > 0.0)
+                    )
+
+                if (has_em_link
+                        or (color_nonzero and strength_nonzero)
+                        or (has_em_link and strength_nonzero)):
+                    analysis.has_emission = True
 
             ss_input = node.inputs.get("Subsurface Weight")
             if ss_input is None:
@@ -367,7 +391,7 @@ def analyze_tree(node_tree: bpy.types.NodeTree) -> TreeAnalysis:
         from_socket = link.from_socket
         to_socket = link.to_socket
 
-        # ── Flatten transparent source nodes (SeparateColor etc.) ─────
+        # ── Flatten transparent source nodes (Geometry/LightPath) ─────
         if from_node.bl_idname in _TRANSPARENT_TYPES:
             result = _trace_transparent_source(from_node)
             if result is not None:
