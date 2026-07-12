@@ -134,17 +134,19 @@ A quick breakdown of every setting in the panel so you know exactly what to clic
 
 | Feature | Description |
 |---|---|
-| 🎯 **Principled BSDF** | Full 20+ input mapping to Universal or Standard Surface Material |
-| 🪆 **Node Groups** | Recursively converts and preserves nested Node Groups |
+| 🎯 **Principled BSDF** | Physically tuned Universal / Standard Surface mapping with safer roughness, specular, coat, sheen, transmission, and Octane-default handling |
+| 🪆 **Node Groups** | Recursively converts and preserves nested Node Groups with interface caching and recursion guards |
 | 🎬 **Driver Preservation** | Automatically transfers `#frame` expressions and animation drivers |
-| 🔗 **Link Reconstruction** | Rebuilds all node connections with 7-strategy socket matching |
-| 🪟 **Glass & Transmission** | Auto-detects transmission > 0.5 and configures specular mode |
+| 🔗 **Link Reconstruction** | Rebuilds topology with 7-strategy socket matching, shared-node preservation, reroute flattening, and duplicate socket handling |
+| 🧭 **Graph Engine** | Cycle-safe dependency scheduling preserves branching, muted nodes, material outputs, and nested group boundaries |
+| 🪟 **Glass & Transmission** | Converts glass, refraction, alpha, and transmission paths without corrupting unrelated Universal Material defaults |
 | 💡 **Emission** | Auto-inserts Octane TextureEmission nodes and perfectly scales Power (x100) |
 | 🌫️ **Volumetrics** | Maps Volume Absorption/Scatter directly to Octane Medium nodes |
-| 🗺️ **Normal & Bump** | Direct-connects normal map textures and translates bump heights |
+| 🗺️ **Normal & Bump** | Preserves normal chains, folds bump height into material inputs, and routes displacement according to user settings |
 | 📦 **Batch Conversion** | Convert entire scenes with one click (now with native Progress Bars!) |
 | 🔄 **Safe Revert** | Non-destructive — instantly swap back to the original Cycles setup |
-| 🧮 **OSL Math Precision** | Flawless translation of Math/VectorMath/Mix nodes via hidden Octane OSL Wrappers |
+| 🛡️ **Structured Fallbacks** | Unsupported or approximate conversions stay visible, produce warnings, and do not crash the conversion |
+| 🧮 **Math & Mix Wrappers** | Uses Octane Cycles-compatible wrappers where available, with native fallbacks for plugin-version differences |
 
 ---
 
@@ -222,20 +224,26 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
                                           └──────────────┘
 ```
 
-1. **Analyze** — Snapshot the Cycles node tree (nodes, links, properties, patterns).
-2. **Schedule** — Topological sort ensures dependencies are created first.
-3. **Create** — Instantiate Octane equivalents using runtime-resolved `bl_idname` candidates.
-4. **Transfer** — 30+ per-type handlers map Cycles values → Octane parameters.
-5. **Rebuild** — 7-strategy socket resolution reconnects all links.
-6. **Post-process** — Fix MixShader order, insert emission nodes, handle Normal/Bump fallbacks, alpha/opacity routing, and volumetrics.
-7. **Gamma** — Apply albedo gamma correction (skips non-color textures).
+1. **Analyze** — Snapshot the Cycles node tree, normalize reroutes, preserve shared branches, and record properties, links, muted state, and output intent.
+2. **Schedule** — Cycle-safe dependency ordering creates upstream nodes first while keeping disconnected and fallback nodes visible.
+3. **Create** — Instantiate Octane equivalents using runtime-resolved `bl_idname` candidates for compatibility across Octane plugin versions.
+4. **Transfer** — Per-type handlers map Cycles values into Octane semantics, preserving Octane defaults where direct value copying would harm material fidelity.
+5. **Rebuild** — 7-strategy socket resolution reconnects links, duplicate socket identities, output indices, and one-to-many channel picker bindings.
+6. **Post-process** — Fix MixShader order, insert emission nodes, compose coat/sheen/specular helper nodes, handle alpha/opacity, Normal/Bump, displacement, and volumetrics.
+7. **Report & Gamma** — Apply albedo gamma correction, log approximate/unsupported conversions, and keep recoverable failures visible for manual review.
 
 ---
 
 ## <a id="supported-nodes"></a>🔌 Supported Nodes
 
+The full support matrix lives in [`octanify/NODE_SUPPORT.md`](octanify/NODE_SUPPORT.md). It currently tracks **99 Cycles node entries**:
+
+- **82 supported or preserved**: 42 direct, 36 approximate, 3 version-dependent, and 1 layout-only.
+- **17 unsupported or out of scope**: 13 unsupported, 2 unsupported in current Octane, and 2 out of scope.
+- Section coverage: Input 13/20, Output 1/4, Shader 23/24, Texture 13/15, Color 6/7, Vector 8/9, Converter 14/15, Script/Group 4/5.
+
 <details>
-<summary><strong>Shaders (15+ types)</strong></summary>
+<summary><strong>Shaders (23 supported / 24 tracked)</strong></summary>
 
 - Principled BSDF → Universal Material / Standard Surface
 - Glass BSDF → Specular Material
@@ -255,7 +263,7 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
 </details>
 
 <details>
-<summary><strong>Textures (11 types)</strong></summary>
+<summary><strong>Textures (13 supported / 15 tracked)</strong></summary>
 
 - Image Texture → Octane Image Texture (with strict colorspace/packed-file handling)
 - Environment / Sky Texture → Octane Image / Daylight Env
@@ -268,7 +276,7 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
 </details>
 
 <details>
-<summary><strong>Input / Vector (15+ types)</strong></summary>
+<summary><strong>Input / Vector (21 supported / 29 tracked)</strong></summary>
 
 - Mapping / Vector Rotate / Transform → 3D Transform
 - Texture Coordinate / UV Map → Mesh UV Projection
@@ -285,7 +293,7 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
 </details>
 
 <details>
-<summary><strong>Color & Math (12+ types)</strong></summary>
+<summary><strong>Color & Math (20 supported / 22 tracked)</strong></summary>
 
 - Math / Vector Math → Mapped to specific Add/Multiply/Math nodes based on inner operation
 - Map Range → Octane Range
@@ -295,7 +303,7 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
 </details>
 
 <details>
-<summary><strong>Volumetrics</strong></summary>
+<summary><strong>Volumetrics (3 supported / 4 tracked)</strong></summary>
 
 - Volume Absorption → Octane Absorption Medium
 - Volume Scatter → Octane Scattering Medium
@@ -303,7 +311,7 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
 </details>
 
 <details>
-<summary><strong>Passthrough & Logic</strong></summary>
+<summary><strong>Passthrough & Logic (4 supported / 5 tracked)</strong></summary>
 
 - Node Groups / Group Input / Group Output — deeply traversed, flattened, and rebuilt
 - Separate Color / RGB / XYZ — handled inline
@@ -319,11 +327,11 @@ octanify/
 ├── __init__.py                 # Entry point, bl_info, scene properties
 ├── blender_manifest.toml       # Blender 4.2+ extension manifest
 ├── core/
-│   ├── node_registry.py        # 40+ Cycles → Octane node mappings
-│   ├── shader_detection.py     # Tree analysis, reroute & transparent flattening
-│   ├── graph_engine.py         # Dependency scheduling & node creation
-│   ├── property_mapper.py      # 30+ per-type value transfer handlers
-│   ├── conversion_engine.py    # Main orchestrator pipeline
+│   ├── node_registry.py        # 99 tracked Cycles node strategies
+│   ├── shader_detection.py     # Tree analysis, reroute flattening, transparent handling
+│   ├── graph_engine.py         # Cycle-safe dependency scheduling & node creation
+│   ├── property_mapper.py      # Per-type value transfer and fidelity-safe defaults
+│   ├── conversion_engine.py    # Main orchestrator, link rebuild, post-processing
 │   ├── gamma_system.py         # Albedo gamma correction
 │   └── volumetric_handler.py   # Volume → Octane medium handling
 ├── ui/

@@ -8,6 +8,8 @@ Provides:
 
 from __future__ import annotations
 
+import re
+
 import bpy
 
 from ..core.conversion_engine import (
@@ -19,6 +21,15 @@ from ..core.gamma_system import update_material_gamma, update_all_materials_gamm
 from ..utils.logger import get_logger
 
 log = get_logger()
+
+
+def _find_socket(collection, *names: str):
+    """Return the first named socket, or the sole/first socket as fallback."""
+    for name in names:
+        socket = collection.get(name)
+        if socket is not None:
+            return socket
+    return collection[0] if len(collection) else None
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +231,10 @@ class OCTANIFY_OT_preview_node_viewport(bpy.types.Operator):
             # Try to set exposure or power to reasonable defaults
             for sock in emission.inputs:
                 if sock.name in ("Exposure", "Power") and hasattr(sock, "default_value"):
-                    try: sock.default_value = 1.0
-                    except: pass
+                    try:
+                        sock.default_value = 1.0
+                    except (AttributeError, TypeError, ValueError):
+                        pass
                     
         # Find Material Output
         output_node = None
@@ -241,20 +254,54 @@ class OCTANIFY_OT_preview_node_viewport(bpy.types.Operator):
             out_sock = active_node.outputs[0]
             # special case: if it's already an emission node, just connect to matte
             if "Emission" in active_node.bl_idname:
-                try: links.new(out_sock, matte.inputs["Emission"])
-                except: pass
+                material_emission = _find_socket(
+                    matte.inputs, "Emission", "Emission color"
+                )
+                if material_emission is None:
+                    self.report({"ERROR"}, "Preview material has no Emission input")
+                    return {"CANCELLED"}
+                try:
+                    links.new(out_sock, material_emission)
+                except (RuntimeError, TypeError) as exc:
+                    self.report({"ERROR"}, f"Cannot link preview emission: {exc}")
+                    return {"CANCELLED"}
             else:
-                tex_sock = emission.inputs.get("Texture") or emission.inputs.get("Color") or emission.inputs[0]
-                links.new(out_sock, tex_sock)
+                tex_sock = _find_socket(emission.inputs, "Texture", "Color", "Input")
+                if tex_sock is None:
+                    self.report({"ERROR"}, "Texture Emission has no texture input")
+                    return {"CANCELLED"}
+                try:
+                    links.new(out_sock, tex_sock)
+                except (RuntimeError, TypeError) as exc:
+                    self.report({"ERROR"}, f"Cannot link node to preview: {exc}")
+                    return {"CANCELLED"}
                 
-                em_out = emission.outputs.get("Emission out") or emission.outputs.get("OutEmission") or emission.outputs[0]
-                mat_em_in = matte.inputs.get("Emission") or matte.inputs.get("Emission color")
-                if mat_em_in:
+                em_out = _find_socket(
+                    emission.outputs, "Emission out", "OutEmission", "Output"
+                )
+                mat_em_in = _find_socket(matte.inputs, "Emission", "Emission color")
+                if em_out is None or mat_em_in is None:
+                    self.report({"ERROR"}, "Preview emission sockets are unavailable")
+                    return {"CANCELLED"}
+                try:
                     links.new(em_out, mat_em_in)
+                except (RuntimeError, TypeError) as exc:
+                    self.report({"ERROR"}, f"Cannot link preview material: {exc}")
+                    return {"CANCELLED"}
+        else:
+            self.report({"WARNING"}, "Selected node has no output to preview")
+            return {"CANCELLED"}
                     
-        mat_out = matte.outputs.get("OutMat") or matte.outputs.get("Material out") or matte.outputs[0]
-        surf_in = output_node.inputs.get("Surface") or output_node.inputs[0]
-        links.new(mat_out, surf_in)
+        mat_out = _find_socket(matte.outputs, "OutMat", "Material out", "Output")
+        surf_in = _find_socket(output_node.inputs, "Surface")
+        if mat_out is None or surf_in is None:
+            self.report({"ERROR"}, "Preview output sockets are unavailable")
+            return {"CANCELLED"}
+        try:
+            links.new(mat_out, surf_in)
+        except (RuntimeError, TypeError) as exc:
+            self.report({"ERROR"}, f"Cannot connect preview to output: {exc}")
+            return {"CANCELLED"}
 
         self.report({"INFO"}, f"Previewing {active_node.name}")
         return {"FINISHED"}
@@ -293,12 +340,34 @@ class OCTANIFY_OT_revert_material(bpy.types.Operator):
             if not hasattr(obj, "material_slots"):
                 continue
             for slot in obj.material_slots:
-                if slot.material and slot.material.name.endswith("_OCTANE"):
-                    orig_name = slot.material.name.replace("_OCTANE", "")
-                    orig_mat = bpy.data.materials.get(orig_name)
-                    if orig_mat:
-                        slot.material = orig_mat
-                        reverted += 1
+                converted_mat = slot.material
+                if converted_mat is None:
+                    continue
+
+                source_name = ""
+                try:
+                    source_name = converted_mat.get(
+                        "octanify_source_material", ""
+                    )
+                except (AttributeError, TypeError):
+                    pass
+
+                # Compatibility for materials converted before provenance
+                # tags were introduced, including Blender's .001 suffixes.
+                if not source_name:
+                    match = re.match(
+                        r"^(?P<source>.+)_OCTANE(?:\.\d{3})?$",
+                        converted_mat.name,
+                    )
+                    if match:
+                        source_name = match.group("source")
+
+                if not source_name:
+                    continue
+                original_mat = bpy.data.materials.get(source_name)
+                if original_mat is not None:
+                    slot.material = original_mat
+                    reverted += 1
         
         if batch_mode == "ACTIVE" and objects:
             self.report({"INFO"}, f"Reverted {reverted} material(s) on '{objects[0].name}'")
@@ -323,7 +392,12 @@ class OCTANIFY_OT_create_basic_material(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        return context.active_object is not None
+        obj = context.active_object
+        return (
+            obj is not None
+            and getattr(obj, "data", None) is not None
+            and hasattr(obj.data, "materials")
+        )
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         obj = context.active_object
@@ -362,6 +436,10 @@ class OCTANIFY_OT_create_basic_material(bpy.types.Operator):
                     continue
 
         if mat_node is None:
+            try:
+                bpy.data.materials.remove(mat)
+            except (RuntimeError, TypeError):
+                pass
             self.report({"ERROR"}, "Cannot create Octane material node — is the Octane plugin loaded?")
             return {"CANCELLED"}
 
@@ -369,14 +447,17 @@ class OCTANIFY_OT_create_basic_material(bpy.types.Operator):
         mat_node.location = (0, 0)
 
         # Connect material to output
-        mat_out = mat_node.outputs.get("OutMat") or mat_node.outputs.get("Material out") or mat_node.outputs[0]
-        surf_in = output_node.inputs.get("Surface") or output_node.inputs[0]
+        mat_out = _find_socket(mat_node.outputs, "OutMat", "Material out", "Output")
+        surf_in = _find_socket(output_node.inputs, "Surface")
+        if mat_out is None or surf_in is None:
+            bpy.data.materials.remove(mat)
+            self.report({"ERROR"}, "Created nodes expose no compatible material output sockets")
+            return {"CANCELLED"}
         links.new(mat_out, surf_in)
 
         # Assign to active object
-        if obj.data and hasattr(obj.data, "materials"):
-            obj.data.materials.append(mat)
-            obj.active_material = mat
+        obj.data.materials.append(mat)
+        obj.active_material = mat
 
         self.report({"INFO"}, f"Created Octane material '{mat.name}' on '{obj.name}'")
         return {"FINISHED"}
@@ -421,7 +502,6 @@ class OCTANIFY_OT_auto_connect_textures(bpy.types.Operator):
                 output_node = n
                 break
             
-        import re
         def guess_socket(filename: str, node_type: str) -> str:
             name = filename.lower()
             # Use word-boundary patterns to avoid false positives 
@@ -445,7 +525,16 @@ class OCTANIFY_OT_auto_connect_textures(bpy.types.Operator):
 
         connected = 0
         for node in nodes:
-            if node.bl_idname in ("ShaderNodeTexImage", "ShaderNodeOctImageTex", "OctaneImageTexture", "OctaneRGBImage"):
+            if node.bl_idname in (
+                "ShaderNodeTexImage",
+                "ShaderNodeOctImageTex",
+                "OctaneImageTexture",
+                "OctaneRGBImage",
+                "OctaneGreyscaleImage",
+                "ShaderNodeOctGreyscaleImage",
+                "OctaneAlphaImage",
+                "ShaderNodeOctAlphaImage",
+            ):
                 # check if it has output links
                 has_links = False
                 for out in node.outputs:
@@ -479,9 +568,19 @@ class OCTANIFY_OT_auto_connect_textures(bpy.types.Operator):
                         elif sock_name == "Roughness": in_sock = target_mat.inputs.get("Specular roughness")
                 
                 if in_sock:
-                    out_sock = node.outputs.get("Color") or node.outputs.get("OutTex") or node.outputs[0]
-                    links.new(out_sock, in_sock)
-                    connected += 1
+                    out_sock = _find_socket(node.outputs, "Color", "OutTex", "Texture out")
+                    if out_sock is None:
+                        continue
+                    try:
+                        links.new(out_sock, in_sock)
+                        connected += 1
+                    except (RuntimeError, TypeError) as exc:
+                        log.warning(
+                            "Auto-connect failed for '%s' -> '%s': %s",
+                            node.name,
+                            in_sock.name,
+                            exc,
+                        )
 
         self.report({"INFO"}, f"Auto-connected {connected} texture(s)")
         return {"FINISHED"}

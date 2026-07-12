@@ -89,12 +89,30 @@ class OCTANIFY_PT_main_panel(bpy.types.Panel):
 
         # ── Conversion Report ─────────────────────────────────────────
         from ..core.report import report_data
-        if report_data.materials_converted > 0:
+        if (
+            report_data.materials_converted > 0
+            or report_data.warnings
+            or report_data.approximations
+        ):
             box = layout.box()
             box.label(text="Last Conversion Report:", icon="INFO")
             col = box.column(align=True)
             col.label(text=f"Materials Converted: {report_data.materials_converted}", icon="MATERIAL")
             col.label(text=f"Nodes Translated: {report_data.nodes_translated}", icon="NODETREE")
+            col.label(text=f"Links Rebuilt: {report_data.links_created}", icon="LINKED")
+            if report_data.links_failed:
+                col.label(text=f"Links Failed: {report_data.links_failed}", icon="ERROR")
+            if report_data.nodes_unsupported:
+                col.label(text=f"Unsupported Nodes: {report_data.nodes_unsupported}", icon="CANCEL")
+
+            if report_data.approximations:
+                box.separator(factor=0.5)
+                box.label(text="Approximations:", icon="INFO")
+                approx_col = box.column(align=True)
+                for item in report_data.approximations[:5]:
+                    approx_col.label(text=item, icon="DOT")
+                if len(report_data.approximations) > 5:
+                    approx_col.label(text=f"...and {len(report_data.approximations) - 5} more")
             
             if report_data.warnings:
                 box.separator(factor=0.5)

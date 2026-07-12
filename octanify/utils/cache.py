@@ -16,6 +16,9 @@ class ConversionCache:
         self._materials: dict[str, str] = {}
         # (material_name, node_name) -> converted node reference
         self._nodes: dict[tuple[str, str], Any] = {}
+        # Conversion keys currently being processed.  This guards recursive
+        # node-group references and is also useful for deterministic cleanup.
+        self._in_progress: set[str] = set()
 
     # ----- material level -----
 
@@ -28,6 +31,10 @@ class ConversionCache:
     def get_converted_material_name(self, original_name: str) -> str | None:
         return self._materials.get(original_name)
 
+    def unregister_material(self, original_name: str) -> None:
+        """Discard a stale material/group cache entry."""
+        self._materials.pop(original_name, None)
+
     # ----- node level -----
 
     def has_node(self, mat_name: str, node_name: str) -> bool:
@@ -39,11 +46,27 @@ class ConversionCache:
     def get_node(self, mat_name: str, node_name: str) -> Any | None:
         return self._nodes.get((mat_name, node_name))
 
+    # ----- in-progress guard -----
+
+    def begin(self, key: str) -> bool:
+        """Mark *key* active, returning False when it is already active."""
+        if key in self._in_progress:
+            return False
+        self._in_progress.add(key)
+        return True
+
+    def end(self, key: str) -> None:
+        self._in_progress.discard(key)
+
+    def is_in_progress(self, key: str) -> bool:
+        return key in self._in_progress
+
     # ----- session control -----
 
     def clear(self) -> None:
         self._materials.clear()
         self._nodes.clear()
+        self._in_progress.clear()
 
     @property
     def converted_material_names(self) -> list[str]:

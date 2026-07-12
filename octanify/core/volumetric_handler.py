@@ -1,8 +1,4 @@
-"""Octanify — Volumetric handler.
-
-Detects Volume Absorption and Volume Scatter nodes from the Cycles
-analysis and connects them as Octane Medium nodes on the material.
-"""
+"""Octanify — topology-aware volumetric reconstruction."""
 
 from __future__ import annotations
 
@@ -10,12 +6,49 @@ from typing import TYPE_CHECKING
 
 import bpy
 
+from .node_registry import resolve_output_socket
+from .report import report_data
 from ..utils.logger import get_logger
 
 if TYPE_CHECKING:
-    from .shader_detection import TreeAnalysis
+    from .shader_detection import LinkInfo, TreeAnalysis
 
 log = get_logger()
+
+
+def _find_input(node: bpy.types.Node, *names: str):
+    for name in names:
+        socket = node.inputs.get(name)
+        if socket is not None:
+            return socket
+    return None
+
+
+def _find_output_link(
+    analysis: "TreeAnalysis",
+    output_name: str,
+    socket_name: str,
+) -> "LinkInfo | None":
+    for link_info in analysis.links:
+        if (link_info.to_node == output_name
+                and link_info.to_socket == socket_name):
+            return link_info
+    return None
+
+
+def _remove_direct_output_link(
+    target_tree: bpy.types.NodeTree,
+    output_node: bpy.types.Node,
+    volume_node: bpy.types.Node,
+) -> None:
+    """Remove the generic Volume-output link once a material medium is wired."""
+    for name in ("Volume", "Medium"):
+        socket = output_node.inputs.get(name)
+        if socket is None:
+            continue
+        for link in list(socket.links):
+            if link.from_node == volume_node:
+                target_tree.links.remove(link)
 
 
 def handle_volumetrics(
@@ -23,141 +56,100 @@ def handle_volumetrics(
     node_map: dict[str, bpy.types.Node],
     target_tree: bpy.types.NodeTree,
 ) -> None:
-    """
-    Post-process volumetric nodes:
-    - Find Octane medium nodes (Absorption / Scatter) in node_map
-    - Connect them to the material's Medium input
+    """Attach each output's original volume branch to its surface material.
+
+    Octane media belong on the corresponding material's Medium input.  The
+    previous implementation selected the first material in the tree and then
+    connected every medium to it, making the result depend on node order and
+    overwriting earlier links.  This reconstruction follows the original
+    Material Output topology instead.
     """
     if not analysis.has_volume:
         return
 
-    # Find the main material node (Universal, Specular, Glossy, Diffuse)
-    material_node = None
-    material_types = {
-        "ShaderNodeOctUniversalMat", "OctaneUniversalMaterial",
-        "ShaderNodeOctSpecularMat", "OctaneSpecularMaterial",
-        "ShaderNodeOctGlossyMat", "OctaneGlossyMaterial",
-        "ShaderNodeOctDiffuseMat", "OctaneDiffuseMaterial",
-    }
+    handled = 0
+    for output_name, output_info in analysis.nodes.items():
+        if output_info.bl_idname != "ShaderNodeOutputMaterial":
+            continue
 
-    for node in target_tree.nodes:
-        if node.bl_idname in material_types:
-            material_node = node
-            break
+        volume_link = _find_output_link(analysis, output_name, "Volume")
+        if volume_link is None:
+            continue
 
-    if material_node is None:
-        log.warning("No Octane material node found for volumetric connection")
-        return
+        surface_link = _find_output_link(analysis, output_name, "Surface")
+        volume_info = analysis.nodes.get(volume_link.from_node)
+        volume_node = node_map.get(volume_link.from_node)
+        output_node = node_map.get(output_name)
+        if volume_info is None or volume_node is None:
+            report_data.add_warning(
+                f"[{target_tree.name}] Volume source for '{output_name}' was not converted"
+            )
+            continue
 
-    # Find medium input on the material
-    medium_input = None
-    for name in ["Medium", "Transmission medium", "Medium input"]:
-        medium_input = material_node.inputs.get(name)
-        if medium_input is not None:
-            break
-
-    if medium_input is None:
-        log.warning(
-            "Material node '%s' has no Medium input for volumetrics",
-            material_node.name,
+        medium_output = resolve_output_socket(
+            volume_info.bl_idname,
+            volume_link.from_socket,
+            volume_node,
+            socket_identifier=volume_link.from_socket_identifier,
         )
-        return
-
-    # Connect each volume node to the material
-    volume_types = {
-        "ShaderNodeVolumeAbsorption",
-        "ShaderNodeVolumeScatter",
-    }
-
-    for node_name, info in analysis.nodes.items():
-        if info.bl_idname not in volume_types:
-            continue
-
-        oct_node = node_map.get(node_name)
-        if oct_node is None:
-            continue
-
-        # Find the medium output socket
-        medium_output = None
-        for out_name in ["OutMedium", "Medium out", "Output", "Medium"]:
-            medium_output = oct_node.outputs.get(out_name)
-            if medium_output is not None:
-                break
-
-        if medium_output is None and oct_node.outputs:
-            medium_output = oct_node.outputs[0]
-
         if medium_output is None:
-            log.warning(
-                "Medium node '%s' has no output socket", oct_node.name
+            report_data.add_warning(
+                f"[{target_tree.name}] Volume node '{volume_link.from_node}' has no medium output"
+            )
+            continue
+
+        material_node = (
+            node_map.get(surface_link.from_node)
+            if surface_link is not None
+            else None
+        )
+        medium_input = (
+            _find_input(
+                material_node,
+                "Medium",
+                "Transmission medium",
+                "Medium input",
+            )
+            if material_node is not None
+            else None
+        )
+
+        if medium_input is None:
+            # A volume-only material may still be accepted by an Octane-aware
+            # Material Output.  Link reconstruction already attempted that
+            # route, so retain it and issue a precise warning for review.
+            material_name = material_node.name if material_node is not None else "<none>"
+            report_data.add_warning(
+                f"[{target_tree.name}] Surface '{material_name}' has no Medium input; "
+                f"kept '{volume_link.from_node}' on Material Output.Volume"
             )
             continue
 
         try:
+            # Inputs accept one link.  Remove a stale/duplicate medium before
+            # creating the topology-derived connection.
+            for existing in list(medium_input.links):
+                target_tree.links.remove(existing)
             target_tree.links.new(medium_output, medium_input)
+            if output_node is not None:
+                _remove_direct_output_link(target_tree, output_node, volume_node)
+            handled += 1
             log.info(
-                "Connected volume '%s' → '%s'.Medium",
-                oct_node.name, material_node.name,
+                "Connected volume '%s' to '%s'.%s",
+                volume_node.name,
+                material_node.name,
+                medium_input.name,
             )
         except Exception as exc:
+            report_data.add_link_failure(
+                f"Failed volume link {volume_link.from_node} -> "
+                f"{material_node.name}.Medium: {exc}"
+            )
             log.warning("Failed to connect volume: %s", exc)
 
-    # Also check if the original tree had Volume connections to Output Material
-    # and ensure they're properly routed through Octane
-    _connect_volume_to_output(analysis, node_map, target_tree)
-
-
-def _connect_volume_to_output(
-    analysis: "TreeAnalysis",
-    node_map: dict[str, bpy.types.Node],
-    target_tree: bpy.types.NodeTree,
-) -> None:
-    """
-    If the Cycles tree had a volume node connected directly to the
-    Material Output's Volume input, connect the Octane medium to the
-    output node as well (if Octane output supports it).
-    """
-    for link_info in analysis.links:
-        to_info = analysis.nodes.get(link_info.to_node)
-        if to_info is None:
-            continue
-        if to_info.bl_idname != "ShaderNodeOutputMaterial":
-            continue
-        if link_info.to_socket != "Volume":
-            continue
-
-        from_info = analysis.nodes.get(link_info.from_node)
-        if from_info is None:
-            continue
-
-        oct_from = node_map.get(link_info.from_node)
-        oct_to = node_map.get(link_info.to_node)
-
-        if oct_from is None or oct_to is None:
-            continue
-
-        # Find volume/medium input on the output node
-        vol_input = None
-        for name in ["Volume", "Medium"]:
-            vol_input = oct_to.inputs.get(name)
-            if vol_input is not None:
-                break
-
-        if vol_input is None:
-            continue
-
-        # Find output on the medium node
-        medium_out = None
-        for out_name in ["OutMedium", "Medium out", "Output"]:
-            medium_out = oct_from.outputs.get(out_name)
-            if medium_out is not None:
-                break
-
-        if medium_out is None and oct_from.outputs:
-            medium_out = oct_from.outputs[0]
-
-        if medium_out is not None:
-            try:
-                target_tree.links.new(medium_out, vol_input)
-            except Exception as exc:
-                log.warning("Failed to connect volume to output: %s", exc)
+    if handled == 0 and not any(
+        "Volume" in warning for warning in report_data.warnings
+    ):
+        report_data.add_warning(
+            f"[{target_tree.name}] Volume nodes were detected but no output volume branch was found"
+        )

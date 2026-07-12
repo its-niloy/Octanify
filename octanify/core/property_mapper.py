@@ -53,11 +53,47 @@ def _set_input(node: "bpy.types.Node", candidates: list[str], value: Any) -> boo
         inp = node.inputs.get(name)
         if inp is not None and hasattr(inp, "default_value"):
             try:
-                inp.default_value = value
+                inp.default_value = _coerce_value_for_socket(inp, value)
                 return True
             except (TypeError, AttributeError):
                 continue
     return False
+
+
+def _is_sequence_value(value: Any) -> bool:
+    return hasattr(value, "__len__") and not isinstance(value, (str, bytes))
+
+
+def _coerce_value_for_socket(socket: "bpy.types.NodeSocket", value: Any) -> Any:
+    """Adapt a Cycles default value to the target Octane socket shape."""
+    if value is None or not hasattr(socket, "default_value"):
+        return value
+
+    target_value = socket.default_value
+    target_is_sequence = _is_sequence_value(target_value)
+    source_is_sequence = _is_sequence_value(value)
+
+    if target_is_sequence:
+        target_len = len(target_value)
+        if source_is_sequence:
+            source = list(value)
+        else:
+            source = [value] * target_len
+
+        if len(source) >= target_len:
+            return tuple(source[:target_len])
+        if target_len == 4 and len(source) == 3:
+            return tuple([*source, 1.0])
+        if source:
+            return tuple([*source, *([source[-1]] * (target_len - len(source)))])
+        return value
+
+    if source_is_sequence:
+        source = list(value)
+        if source:
+            return source[0]
+
+    return value
 
 
 def _set_prop(node: "bpy.types.Node", attr: str, value: Any) -> bool:
@@ -112,6 +148,20 @@ def _get_output_value(info: "NodeInfo", name: str, default: Any = None) -> Any:
     return default
 
 
+def _weighted_color(color: Any, weight: Any) -> tuple[float, float, float]:
+    """Return an Octane layer colour representing Cycles tint × weight."""
+    try:
+        scalar = float(weight)
+    except (TypeError, ValueError):
+        scalar = 0.0
+    if not _is_sequence_value(color):
+        color = (color, color, color)
+    values = list(color)[:3]
+    while len(values) < 3:
+        values.append(values[-1] if values else 1.0)
+    return tuple(float(component) * scalar for component in values)
+
+
 # ---------------------------------------------------------------------------
 # Main dispatcher
 # ---------------------------------------------------------------------------
@@ -135,34 +185,24 @@ def transfer_properties(
 # ---------------------------------------------------------------------------
 
 def _transfer_principled(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """Principled BSDF → Universal Material."""
-    bid = "ShaderNodeBsdfPrincipled"
+    """Principled BSDF → Universal Material without corrupting layer defaults.
 
-    # Simple float / color inputs
+    Universal's Coating and Sheen inputs encode coloured layer strength;
+    Cycles exposes independent weight and tint controls.  Diffuse Roughness is
+    also not Universal's main specular Roughness.  Treating these sockets as
+    interchangeable was the root cause of default Principled nodes becoming
+    perfectly smooth, fully coated materials.
+    """
+
+    # Only semantically equivalent socket values belong in this direct list.
     _simple_transfers = [
         ("Base Color",           "Albedo color", "Albedo", "Diffuse", "Base color"),
         ("Metallic",             "Metallic", "Metallic float", "Metalness"),
         ("Roughness",            "Roughness", "Roughness float", "Specular roughness"),
-        ("Diffuse Roughness",    "Roughness", "Roughness float", "Diffuse roughness"),
-        ("Specular IOR Level",   "Specular", "Specular float"),
-        ("Specular Tint",        "Specular tint", "Specular map", "Specular color"),
         ("IOR",                  "Dielectric IOR", "Index", "IOR", "Specular IOR"),
         ("Alpha",                "Opacity", "Opacity float"),
-        ("Tangent",              "Anisotropy rotation", "Rotation"),
-        ("Coat Weight",          "Coating", "Coating float"),
-        ("Coat Roughness",       "Coating roughness", "Coating roughness float"),
-        ("Coat IOR",             "Coating IOR"),
-        ("Coat Tint",            "Coating", "Coating color"),
-        ("Sheen Weight",         "Sheen", "Sheen float"),
-        ("Sheen Roughness",      "Sheen roughness", "Sheen roughness float"),
-        ("Sheen Tint",           "Sheen", "Sheen color", "Sheen tint"),
         ("Anisotropic",          "Anisotropy", "Anisotropy float"),
         ("Anisotropic Rotation", "Anisotropy rotation", "Rotation"),
-        ("Thin Film Thickness",  "Film width", "Thin film thickness"),
-        ("Thin Film IOR",        "Film IOR", "Thin film IOR"),
-        ("Subsurface Weight",    "SSS", "Subsurface"),
-        ("Subsurface IOR",       "Index", "IOR"),
-        ("Subsurface Anisotropy", "Anisotropy", "Subsurface anisotropy"),
     ]
 
     for mapping in _simple_transfers:
@@ -172,48 +212,56 @@ def _transfer_principled(info: "NodeInfo", node: "bpy.types.Node") -> None:
         if value is not None:
             _set_input(node, oct_candidates, value)
 
-    # Emission — even if strength is 0, preserve if color is set
-    em_color = _get_input_value(info, "Emission Color")
-    em_strength = _get_input_value(info, "Emission Strength")
-    if em_color is not None:
-        _set_input(node, ["Emission", "Emission color"], em_color)
-    if em_strength is not None:
-        _set_input(node, ["Emission power", "Emission weight", "Power"], em_strength * 100.0)
-        # Enable surface brightness if emission detected
-        if isinstance(em_strength, (int, float)) and em_strength > 0.0:
-            _set_prop(node, "surface_brightness", True)
-        elif em_color is not None:
-            cols = tuple(em_color)[:3] if hasattr(em_color, "__len__") else (0,)
-            if any(c > 0.0 for c in cols):
-                _set_prop(node, "surface_brightness", True)
+    # Cycles' default Specular IOR Level is 0.5 while Octane's physically
+    # equivalent Universal Specular channel defaults to 1.0.  OTOY's own
+    # converter applies this factor of two as well.
+    specular_level = _get_input_value(info, "Specular IOR Level")
+    if isinstance(specular_level, (int, float)):
+        _set_input(node, ["Specular", "Specular float"], specular_level * 2.0)
 
-    # Transmission → glass treatment if > 0.5
+    # Cycles weight × tint corresponds to Octane's coloured layer strength.
+    coat_weight = _get_input_value(info, "Coat Weight", 0.0)
+    coat_tint = _get_input_value(info, "Coat Tint", (1.0, 1.0, 1.0, 1.0))
+    _set_input(node, ["Coating", "Coating color"],
+               _weighted_color(coat_tint, coat_weight))
+    if isinstance(coat_weight, (int, float)) and coat_weight > 0.0:
+        _set_input(node, ["Coating roughness", "Coating roughness float"],
+                   _get_input_value(info, "Coat Roughness", 0.03))
+        _set_input(node, ["Coating IOR"],
+                   _get_input_value(info, "Coat IOR", 1.5))
+
+    sheen_weight = _get_input_value(info, "Sheen Weight", 0.0)
+    sheen_tint = _get_input_value(info, "Sheen Tint", (1.0, 1.0, 1.0, 1.0))
+    _set_input(node, ["Sheen", "Sheen color"],
+               _weighted_color(sheen_tint, sheen_weight))
+    if isinstance(sheen_weight, (int, float)) and sheen_weight > 0.0:
+        _set_input(node, ["Sheen roughness", "Sheen roughness float"],
+                   _get_input_value(info, "Sheen Roughness", 0.5))
+
+    # Film IOR has no effect when width is zero.  Preserve Octane's own IOR
+    # default for inactive thin film instead of writing an unrelated Cycles
+    # default into hidden state.
+    film_width = _get_input_value(info, "Thin Film Thickness", 0.0)
+    if isinstance(film_width, (int, float)) and film_width > 0.0:
+        _set_input(node, ["Film width", "Thin film thickness"], film_width)
+        _set_input(node, ["Film IOR", "Thin film IOR"],
+                   _get_input_value(info, "Thin Film IOR", 1.33))
+
+    # Transmission is a link-only texture input in current Octane.  Linked
+    # values are rebuilt normally and unlinked non-zero values are materialised
+    # by the Principled post-process in conversion_engine.
     tw = _get_input_value(info, "Transmission Weight")
     if tw is None:
         tw = _get_input_value(info, "Transmission")
-    if tw is not None and isinstance(tw, (int, float)):
-        _set_input(node, ["Transmission", "Transmission float"], tw)
-        if tw > 0.5:
-            # Set albedo to black, move base color to transmission
-            _set_input(node, ["Albedo color", "Albedo", "Diffuse"], (0.0, 0.0, 0.0, 1.0))
-            bc = _get_input_value(info, "Base Color")
-            if bc is not None:
-                _set_input(node, ["Transmission color", "Transmission"], bc)
-            # Enable fake shadows
-            _set_prop(node, "fake_shadows", True)
-
-    # Subsurface radius / scale
-    ss_rad = _get_input_value(info, "Subsurface Radius")
-    if ss_rad is not None:
-        _set_input(node, ["Absorption", "Medium radius"], ss_rad)
-    ss_scale = _get_input_value(info, "Subsurface Scale")
-    if ss_scale is not None:
-        _set_input(node, ["Density", "Medium scale"], ss_scale)
+    if isinstance(tw, (int, float)):
+        _set_input(node, ["Transmission float"], tw)
 
 
 def _transfer_glass(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Glass BSDF → Specular Material."""
-    _set_input(node, ["Reflection", "Specular", "Albedo color"],
+    _set_input(node, ["Reflection", "Specular"],
+               (1.0, 1.0, 1.0, 1.0))
+    _set_input(node, ["Transmission color", "Transmission"],
                _get_input_value(info, "Color", (1.0, 1.0, 1.0, 1.0)))
     _set_input(node, ["Roughness", "Roughness float"],
                _get_input_value(info, "Roughness", 0.0))
@@ -252,12 +300,16 @@ def _transfer_emission(info: "NodeInfo", node: "bpy.types.Node") -> None:
 def _transfer_translucent(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Translucent BSDF → Diffuse Material (transmission channel)."""
     _set_input(node, ["Diffuse", "Albedo color", "Albedo"],
+               (0.0, 0.0, 0.0, 1.0))
+    _set_input(node, ["Transmission", "Transmission color"],
                _get_input_value(info, "Color", (0.8, 0.8, 0.8, 1.0)))
 
 
 def _transfer_refraction(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Refraction BSDF → Specular Material."""
-    _set_input(node, ["Reflection", "Specular", "Albedo color"],
+    _set_input(node, ["Reflection", "Specular"],
+               (1.0, 1.0, 1.0, 1.0))
+    _set_input(node, ["Transmission color", "Transmission"],
                _get_input_value(info, "Color", (1.0, 1.0, 1.0, 1.0)))
     _set_input(node, ["Roughness", "Roughness float"],
                _get_input_value(info, "Roughness", 0.0))
@@ -283,6 +335,22 @@ def _transfer_image_texture(info: "NodeInfo", node: "bpy.types.Node") -> None:
     img = info.properties.get("image")
     if img is not None:
         _set_prop(node, "image", img)
+
+    image_user = info.properties.get("image_user", {})
+    for attr, val in image_user.items():
+        if val is not None:
+            transferred = False
+            target_image_user = getattr(node, "image_user", None)
+            if target_image_user is not None:
+                try:
+                    setattr(target_image_user, attr, val)
+                    transferred = True
+                except (AttributeError, TypeError):
+                    pass
+            # Older Octane builds expose some animation controls directly on
+            # the node rather than through Blender's image_user wrapper.
+            if not transferred:
+                _set_prop(node, attr, val)
 
     # Colorspace → gamma
     cs = info.properties.get("colorspace", "sRGB")
@@ -353,10 +421,28 @@ def _transfer_displacement(info: "NodeInfo", node: "bpy.types.Node") -> None:
         scene = bpy.context.scene
         disp_mode = getattr(scene, "octanify_disp_mode", "TEXTURE")
         if disp_mode == "TEXTURE":
-            lod_value = getattr(scene, "octanify_disp_level_of_detail", "1024x1024")
-            if lod_value.isdigit(): # Legacy int fallback
-                lod_dict = {"8": "256x256", "9": "512x512", "10": "1024x1024", "11": "2048x2048", "12": "4096x4096", "13": "8192x8192", "14": "16384x16384"}
-                lod_value = lod_dict.get(lod_value, "1024x1024")
+            lod_value = str(
+                getattr(scene, "octanify_disp_level_of_detail", "3")
+            )
+            # Current UI identifiers are 0..5.  Versions before 1.1 used
+            # Octane's enum identifiers 8..14, so retain those as a migration
+            # path while mapping both schemes to the displayed resolution.
+            lod_dict = {
+                "0": "256x256",
+                "1": "512x512",
+                "2": "1024x1024",
+                "3": "2048x2048",
+                "4": "4096x4096",
+                "5": "8192x8192",
+                "8": "256x256",
+                "9": "512x512",
+                "10": "1024x1024",
+                "11": "2048x2048",
+                "12": "4096x4096",
+                "13": "8192x8192",
+                "14": "16384x16384",
+            }
+            lod_value = lod_dict.get(lod_value, lod_value)
             _set_input(node, ["Level of detail"], lod_value)
         
         pref_mid = getattr(scene, "octanify_disp_mid_level", 0.5)
@@ -528,7 +614,7 @@ def _transfer_fresnel(info: "NodeInfo", node: "bpy.types.Node") -> None:
     if ior is None:
         ior = _get_input_value(info, "Blend", 0.5)
     if ior is not None:
-        _set_input(node, ["IOR", "Index", "Power"], ior)
+        _set_input(node, ["IOR", "Index", "Power", "Falloff skew factor"], ior)
 
 
 def _transfer_vertex_color(info: "NodeInfo", node: "bpy.types.Node") -> None:
@@ -654,6 +740,33 @@ def _transfer_color_ramp(info: "NodeInfo", node: "bpy.types.Node") -> None:
             elements_transferred = True
         except (TypeError, AttributeError, RuntimeError):
             pass  # elements API not available — fall through to start/end
+
+    # Current Octane builds store the editable ramp in a hidden helper node.
+    if not elements_transferred and hasattr(node, "color_ramp_name"):
+        try:
+            from octane.utils import utility as octane_utility
+
+            helper = octane_utility.get_octane_helper_node(node.color_ramp_name)
+            color_ramp = helper.color_ramp if helper is not None else None
+            if color_ramp is not None:
+                while len(color_ramp.elements) > 1:
+                    color_ramp.elements.remove(color_ramp.elements[-1])
+                for index, stop in enumerate(stops):
+                    element = (
+                        color_ramp.elements[0]
+                        if index == 0
+                        else color_ramp.elements.new(stop["position"])
+                    )
+                    element.position = stop["position"]
+                    element.color = stop["color"]
+                color_ramp.interpolation = info.properties.get(
+                    "interpolation", "LINEAR"
+                )
+                if hasattr(node, "dumps_color_ramp_data"):
+                    node.dumps_color_ramp_data()
+                elements_transferred = True
+        except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
+            pass
 
     # Strategy 2: Fallback — set start and end colors via input sockets
     if not elements_transferred:
@@ -801,7 +914,7 @@ def _transfer_separate_color(info: "NodeInfo", node: "bpy.types.Node") -> None:
         short_type = info.bl_idname.replace("ShaderNode", "")
         node.label = f"[Channel Split] {info.label}"
         mat_name = node.id_data.name.replace("_OCTANE", "") if node.id_data else "?"
-        report_data.add_warning(
+        report_data.add_approximation(
             f"[{mat_name}] Channel split preserved via workaround: {short_type}"
         )
 
@@ -816,15 +929,21 @@ def _transfer_combine_color(info: "NodeInfo", node: "bpy.types.Node") -> None:
     # Transfer default channel values
     bid = info.bl_idname
     if bid in ("ShaderNodeCombineColor", "ShaderNodeCombineRGB"):
-        r = _get_input_value(info, "Red") or _get_input_value(info, "R")
-        g = _get_input_value(info, "Green") or _get_input_value(info, "G")
-        b = _get_input_value(info, "Blue") or _get_input_value(info, "B")
+        r = _get_input_value(info, "Red")
+        g = _get_input_value(info, "Green")
+        b = _get_input_value(info, "Blue")
+        if r is None:
+            r = _get_input_value(info, "R")
+        if g is None:
+            g = _get_input_value(info, "G")
+        if b is None:
+            b = _get_input_value(info, "B")
         if r is not None:
-            _set_input(node, ["Texture1", "Input1", "Color1", "R"], r)
+            _set_input(node, ["First channel", "Texture1", "Input1", "Color1", "R"], r)
         if g is not None:
-            _set_input(node, ["Texture2", "Input2", "Color2", "G"], g)
+            _set_input(node, ["Second channel", "Texture2", "Input2", "Color2", "G"], g)
         if b is not None:
-            _set_input(node, ["Texture3", "Input3", "B"], b)
+            _set_input(node, ["Third channel", "Texture3", "Input3", "B"], b)
     elif bid == "ShaderNodeCombineXYZ":
         x = _get_input_value(info, "X")
         y = _get_input_value(info, "Y")
@@ -843,7 +962,7 @@ def _transfer_combine_color(info: "NodeInfo", node: "bpy.types.Node") -> None:
         short_type = info.bl_idname.replace("ShaderNode", "")
         node.label = f"[Channel Combine] {info.label}"
         mat_name = node.id_data.name.replace("_OCTANE", "") if node.id_data else "?"
-        report_data.add_warning(
+        report_data.add_approximation(
             f"[{mat_name}] Channel combine preserved via workaround: {short_type}"
         )
 

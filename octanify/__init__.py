@@ -18,7 +18,7 @@ from __future__ import annotations
 bl_info = {
     "name": "Octanify",
     "author": "Niloy Bhowmick",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Octanify",
     "description": "Convert Cycles materials to Octane materials with one click",
@@ -99,12 +99,16 @@ def _register_properties() -> None:
 
 
 def _unregister_properties() -> None:
-    del bpy.types.Scene.octanify_batch_mode
-    del bpy.types.Scene.octanify_albedo_gamma
-    del bpy.types.Scene.octanify_base_material
-    del bpy.types.Scene.octanify_disp_mode
-    del bpy.types.Scene.octanify_disp_mid_level
-    del bpy.types.Scene.octanify_disp_level_of_detail
+    for name in (
+        "octanify_batch_mode",
+        "octanify_albedo_gamma",
+        "octanify_base_material",
+        "octanify_disp_mode",
+        "octanify_disp_mid_level",
+        "octanify_disp_level_of_detail",
+    ):
+        if hasattr(bpy.types.Scene, name):
+            delattr(bpy.types.Scene, name)
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +117,22 @@ def _unregister_properties() -> None:
 
 def register() -> None:
     _register_properties()
-    panel.register()
-    operators.register()
+    try:
+        panel.register()
+        operators.register()
+    except Exception:
+        # Blender can call register repeatedly during add-on reloads.  Never
+        # leave Scene RNA properties behind after a partial class failure.
+        try:
+            operators.unregister()
+        except Exception:
+            pass
+        try:
+            panel.unregister()
+        except Exception:
+            pass
+        _unregister_properties()
+        raise
 
 
 def unregister() -> None:

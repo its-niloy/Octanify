@@ -88,11 +88,11 @@ class TreeAnalysis:
 # them transparent caused _trace_transparent_source to return a single
 # upstream source for ALL output channels, destroying packed texture
 # channel identity (e.g., ORM maps: R=Roughness, G=Metallic, B=AO).
-_TRANSPARENT_TYPES: set[str] = {
-    # Info nodes with no Octane equivalent
-    "ShaderNodeNewGeometry",
-    "ShaderNodeLightPath",
-}
+# Source/info nodes cannot be flattened: unlike a reroute they have no input
+# carrying an equivalent value.  Treat unsupported info nodes as regular
+# nodes so the graph engine emits a visible fallback and conversion warning
+# instead of silently dropping every connection.
+_TRANSPARENT_TYPES: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +216,10 @@ _PROPERTY_KEYS: dict[str, list[str]] = {
 
 def _snapshot_properties(node: bpy.types.Node, info: NodeInfo) -> None:
     """Capture important Cycles node properties into the info dict."""
+    for key in ("mute", "hide"):
+        if hasattr(node, key):
+            info.properties[key] = bool(getattr(node, key))
+
     keys = _PROPERTY_KEYS.get(node.bl_idname, [])
     for key in keys:
         val = getattr(node, key, None)
@@ -230,6 +234,15 @@ def _snapshot_properties(node: bpy.types.Node, info: NodeInfo) -> None:
             info.properties["image_name"] = img.name
             info.properties["filepath"] = img.filepath
             info.properties["colorspace"] = img.colorspace_settings.name
+        image_user = getattr(node, "image_user", None)
+        if image_user is not None:
+            info.properties["image_user"] = {
+                "frame_duration": getattr(image_user, "frame_duration", None),
+                "frame_offset": getattr(image_user, "frame_offset", None),
+                "frame_start": getattr(image_user, "frame_start", None),
+                "use_auto_refresh": getattr(image_user, "use_auto_refresh", None),
+                "use_cyclic": getattr(image_user, "use_cyclic", None),
+            }
 
     # ColorRamp special handling
     if node.bl_idname == "ShaderNodeValToRGB":

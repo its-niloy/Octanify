@@ -77,6 +77,8 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "ShaderNodeOctUniversalMat",
     ],
     "ShaderNodeBsdfRayPortal": [
+        "ShaderNodeOctPortalMat",
+        "OctanePortalMaterial",
         "ShaderNodeOctNullMat",
         "OctaneNullMaterial",
     ],
@@ -108,10 +110,13 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneNoiseTexture",
     ],
     "ShaderNodeTexVoronoi": [
+        "OctaneSmoothVoronoiContours",
+        "OctaneCellNoise",
         "ShaderNodeOctVoronoiTex",
         "OctaneVoronoiTexture",
     ],
     "ShaderNodeTexWave": [
+        "OctaneWavePattern",
         "ShaderNodeOctWaveTex",
         "OctaneWaveTexture",
     ],
@@ -128,6 +133,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneMarbleTexture",
     ],
     "ShaderNodeTexGradient": [
+        "OctaneGradientGenerator",
         "ShaderNodeOctGradientTex",
         "OctaneGradientTexture",
     ],
@@ -155,6 +161,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
 
     # ── Color / Math ─────────────────────────────────────────────────────
     "ShaderNodeValToRGB": [
+        "OctaneGradientMap",
         "ShaderNodeOctGradientTex",
         "OctaneGradientTexture",
     ],
@@ -187,6 +194,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneColorCorrection",
     ],
     "ShaderNodeGamma": [
+        "OctaneColorCorrection",
         "ShaderNodeOctGammaCorrectionTex",
         "OctaneGammaCorrection",
     ],
@@ -203,6 +211,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneRange",
     ],
     "ShaderNodeClamp": [
+        "OctaneClampTexture",
         "ShaderNodeOctClampTex",
         "OctaneClamp",
     ],
@@ -225,6 +234,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
 
     # ── Input / Vector ───────────────────────────────────────────────────
     "ShaderNodeMapping": [
+        "Octane3DTransformation",
         "ShaderNodeOct3DTransform",
         "ShaderNodeOctFullTransform",
         "OctaneTransform3D",
@@ -263,10 +273,12 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneFloatValue",
     ],
     "ShaderNodeFresnel": [
+        "OctaneFalloffMap",
         "ShaderNodeOctFresnelTex",
         "OctaneFresnel",
     ],
     "ShaderNodeLayerWeight": [
+        "OctaneFalloffMap",
         "ShaderNodeOctFresnelTex",
         "OctaneFresnel",
     ],
@@ -275,6 +287,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneColorVertexAttribute",
     ],
     "ShaderNodeAttribute": [
+        "OctaneColorVertexAttribute",
         "ShaderNodeOctAttributeTex",
         "OctaneAttribute",
     ],
@@ -286,10 +299,12 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneCyclesNodeVectorMathNodeWrapper",
     ],
     "ShaderNodeVectorRotate": [
+        "Octane3DTransformation",
         "ShaderNodeOct3DTransform",
         "OctaneTransform3D",
     ],
     "ShaderNodeVectorTransform": [
+        "Octane3DTransformation",
         "ShaderNodeOct3DTransform",
         "OctaneTransform3D",
     ],
@@ -298,10 +313,12 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "ShaderNodeOctVertexDisplacementTex",
     ],
     "ShaderNodeNormal": [
+        "OctaneNormal",
         "ShaderNodeOctNormalMapTex",
         "OctaneNormalTexture",
     ],
     "ShaderNodeTangent": [
+        "OctaneSurfaceTangentDPdu",
         "ShaderNodeOctNormalMapTex",
         "OctaneNormalTexture",
     ],
@@ -310,6 +327,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneInstanceColor",
     ],
     "ShaderNodeCameraData": [
+        "OctaneCameraData",
         "ShaderNodeOctFloatTex",
     ],
     "ShaderNodeParticleInfo": [
@@ -328,16 +346,19 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneWireframe",
     ],
     "ShaderNodeBevel": [
+        "OctaneRoundEdges",
         "ShaderNodeOctBevelTex",
         "OctaneBevelTexture",
     ],
 
     # ── Volume ───────────────────────────────────────────────────────────
     "ShaderNodeVolumeAbsorption": [
+        "OctaneAbsorption",
         "ShaderNodeOctAbsorptionMedium",
         "OctaneAbsorptionMedium",
     ],
     "ShaderNodeVolumeScatter": [
+        "OctaneScattering",
         "ShaderNodeOctScatterMedium",
         "OctaneScatteringMedium",
     ],
@@ -369,11 +390,15 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneColorCorrection",
     ],
     "ShaderNodeCombineColor": [
+        "ShaderNodeOctChannelMergerTex",
+        "OctaneChannelMerger",
         "OctaneCombineColor",
         "ShaderNodeOctAddTex",
         "OctaneAddTexture",
     ],
     "ShaderNodeCombineRGB": [
+        "ShaderNodeOctChannelMergerTex",
+        "OctaneChannelMerger",
         "OctaneCombineColor",
         "ShaderNodeOctAddTex",
         "OctaneAddTexture",
@@ -388,14 +413,59 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
 # Nodes that are passed through (logic handled inline, no 1:1 node creation)
 # BUG 1 FIX: Separate*/Combine* removed — they now get proper Octane nodes
 PASSTHROUGH_TYPES: set[str] = {
-    "ShaderNodeNewGeometry",
-    "ShaderNodeLightPath",
     "ShaderNodeOutputMaterial",
     "ShaderNodeGroup",
     "NodeReroute",
     "NodeFrame",
     "NodeGroupInput",
     "NodeGroupOutput",
+}
+
+# Mappings that intentionally preserve only an approximation of Cycles
+# semantics.  A node can be creatable and still be lossy; surfacing that
+# distinction prevents the UI and support report from claiming false parity.
+APPROXIMATION_NOTES: dict[str, str] = {
+    "ShaderNodeAddShader": "Add Shader is approximated by a 50/50 Mix Material",
+    "ShaderNodeBsdfSheen": "Sheen BSDF is approximated with Universal Material",
+    "ShaderNodeBsdfHair": "Hair BSDF parameters vary across Octane versions",
+    "ShaderNodeBsdfHairPrincipled": "Principled Hair uses a best-effort Hair/Universal mapping",
+    "ShaderNodeSubsurfaceScattering": "Standalone SSS is approximated with Universal Material inputs",
+    "ShaderNodeBackground": "Background is material-scoped; world environment conversion is not automatic",
+    "ShaderNodeHoldout": "Holdout is approximated with Null Material",
+    "ShaderNodeEeveeSpecular": "Specular BSDF is approximated with Octane Specular Material",
+    "ShaderNodeTexMusgrave": "Musgrave is approximated with Octane Noise",
+    "ShaderNodeTexNoise": "Cycles and Octane Noise algorithms and multi-outputs differ",
+    "ShaderNodeTexVoronoi": "Voronoi feature/distance modes require manual verification",
+    "ShaderNodeTexWave": "Cycles and Octane Wave modes are not one-to-one",
+    "ShaderNodeTexChecker": "Checker factor and color outputs may share one Octane texture output",
+    "ShaderNodeTexGradient": "Gradient modes differ between Cycles and Octane",
+    "ShaderNodeTexBrick": "Brick is approximated with Octane Marble",
+    "ShaderNodeTexMagic": "Magic is approximated with Octane Marble",
+    "ShaderNodeTexWhiteNoise": "White Noise is approximated with Octane Noise",
+    "ShaderNodeTexGabor": "Gabor is approximated with Octane Noise",
+    "ShaderNodeRGBCurves": "RGB Curves uses Color Correction and cannot preserve arbitrary curves",
+    "ShaderNodeValToRGB": "Gradient transfer depends on Octane version and may preserve only endpoints",
+    "ShaderNodeWavelength": "Wavelength is approximated by a static RGB value",
+    "ShaderNodeShaderToRGB": "Shader to RGB has no physically equivalent Octane operation",
+    "ShaderNodeVectorRotate": "Vector Rotate is approximated with a 3D Transform",
+    "ShaderNodeVectorTransform": "Vector Transform is approximated with a 3D Transform",
+    "ShaderNodeNormal": "Cycles Normal output modes require manual verification",
+    "ShaderNodeTangent": "Cycles Tangent output modes require manual verification",
+    "ShaderNodeTexCoord": "Only compatible projection outputs are preserved; coordinate modes differ",
+    "ShaderNodeLayerWeight": "Facing and Fresnel outputs are approximated with one Fresnel texture",
+    "ShaderNodeVertexColor": "Vertex color alpha may require a separate attribute setup",
+    "ShaderNodeAttribute": "Attribute color/vector/factor outputs share an Octane attribute source",
+    "ShaderNodeAmbientOcclusion": "AO color and factor outputs use Octane Dirt approximation",
+    "ShaderNodeObjectInfo": "Only Octane instance-color-compatible Object Info uses are preserved",
+    "ShaderNodeParticleInfo": "Particle Info outputs are not one-to-one with a Float value",
+    "ShaderNodeVolumeInfo": "Volume Info outputs are not one-to-one with a Float value",
+    "ShaderNodeVolumePrincipled": "Principled Volume uses a best-effort Octane medium mapping",
+    "ShaderNodeSeparateColor": "Channel splitting depends on the installed Octane channel utility node",
+    "ShaderNodeSeparateRGB": "Channel splitting depends on the installed Octane channel utility node",
+    "ShaderNodeSeparateXYZ": "Vector channel splitting is approximate when no native wrapper is available",
+    "ShaderNodeCombineColor": "Channel combining is approximate when no native merger is available",
+    "ShaderNodeCombineRGB": "Channel combining is approximate when no native merger is available",
+    "ShaderNodeCombineXYZ": "Vector combining is approximate when no native merger is available",
 }
 
 # Nodes to completely skip (decorative / layout only)
@@ -496,14 +566,14 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Base Color":           ["Albedo color", "Albedo", "Diffuse", "Base color"],
         "Metallic":             ["Metallic", "Metallic float", "Metalness"],
         "Roughness":            ["Roughness", "Roughness float", "Specular roughness"],
-        "Diffuse Roughness":    ["Roughness", "Roughness float", "Diffuse roughness"],
         "Specular IOR Level":   ["Specular", "Specular float"],
-        "Specular Tint":        ["Specular tint", "Specular map", "Specular color"],
         "IOR":                  ["Dielectric IOR", "Index", "IOR", "Specular IOR"],
         "Transmission Weight":  ["Transmission", "Transmission float"],
         "Alpha":                ["Opacity", "Opacity float"],
         "Normal":               ["Normal", "Bump", "ShaderNormal"],
-        "Tangent":              ["Anisotropy rotation", "Rotation"],
+        # Octane's Coating and Sheen sockets are layer colours rather than
+        # scalar weights.  Weight × tint is assembled by a dedicated graph
+        # pass; mapping either input directly enables the layer at full power.
         "Coat Weight":          ["Coating", "Coating float"],
         "Coat Roughness":       ["Coating roughness", "Coating roughness float"],
         "Coat Normal":          ["Coating normal", "Coating bump"],
@@ -514,18 +584,13 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Sheen Tint":           ["Sheen", "Sheen color", "Sheen tint"],
         "Emission Color":       ["Emission", "Emission color"],
         "Emission Strength":    ["Emission power", "Emission weight"],
-        "Subsurface Weight":    ["SSS", "Subsurface"],
-        "Subsurface Radius":    ["Absorption", "Medium radius"],
-        "Subsurface Scale":     ["Density", "Medium scale"],
-        "Subsurface IOR":       ["Index", "IOR"],
-        "Subsurface Anisotropy": ["Anisotropy", "Subsurface anisotropy"],
         "Anisotropic":          ["Anisotropy", "Anisotropy float"],
         "Anisotropic Rotation": ["Anisotropy rotation", "Rotation"],
         "Thin Film Thickness":  ["Film width", "Thin film thickness"],
         "Thin Film IOR":        ["Film IOR", "Thin film IOR"],
     },
     "ShaderNodeBsdfGlass": {
-        "Color":     ["Reflection", "Specular", "Albedo color"],
+        "Color":     ["Transmission color", "Transmission", "Reflection"],
         "Roughness": ["Roughness", "Roughness float"],
         "IOR":       ["Index", "IOR", "Dielectric IOR"],
         "Normal":    ["Normal", "Bump"],
@@ -545,11 +610,11 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Strength": ["Emission power", "Power"],
     },
     "ShaderNodeBsdfTranslucent": {
-        "Color":  ["Diffuse", "Albedo color", "Albedo"],
+        "Color":  ["Transmission", "Transmission color", "Diffuse"],
         "Normal": ["Normal", "Bump"],
     },
     "ShaderNodeBsdfRefraction": {
-        "Color":     ["Reflection", "Specular", "Albedo color"],
+        "Color":     ["Transmission color", "Transmission", "Reflection"],
         "Roughness": ["Roughness", "Roughness float"],
         "IOR":       ["Index", "IOR", "Dielectric IOR"],
         "Normal":    ["Normal", "Bump"],
@@ -670,22 +735,26 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "To Max":   ["Output max", "ToMax"],
     },
     "ShaderNodeClamp": {
-        "Value": ["Input", "Value"],
+        "Value": ["Input texture", "Input", "Value"],
         "Min":   ["Minimum", "Min"],
         "Max":   ["Maximum", "Max"],
     },
     "ShaderNodeFresnel": {
-        "IOR":    ["IOR", "Index"],
+        "IOR":    ["IOR", "Index", "Falloff skew factor"],
         "Normal": ["Normal"],
     },
     "ShaderNodeLayerWeight": {
-        "Blend":  ["IOR", "Index", "Power"],
+        "Blend":  ["IOR", "Index", "Power", "Falloff skew factor"],
         "Normal": ["Normal"],
     },
     "ShaderNodeAmbientOcclusion": {
         "Color":    ["Inclination color", "Bright color", "Color"],
         "Distance": ["Radius", "Distance"],
         "Normal":   ["Normal"],
+    },
+    "ShaderNodeBevel": {
+        "Radius": ["Radius"],
+        "Samples": ["Samples"],
     },
     "ShaderNodeVolumeAbsorption": {
         "Color":   ["Absorption", "Color"],
@@ -697,7 +766,7 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Anisotropy": ["Phase", "Anisotropy"],
     },
     "ShaderNodeValToRGB": {
-        "Fac": ["Input", "Value", "Amount"],
+        "Fac": ["Input texture", "Input", "Value", "Amount"],
     },
     "ShaderNodeOutputMaterial": {
         "Surface":      ["Surface", "Shader", "Material"],
@@ -769,14 +838,14 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Vector": ["Texture", "Input", "Color"],
     },
     "ShaderNodeCombineColor": {
-        "Red":   ["Texture1", "Input1", "Color1", "R"],
-        "Green": ["Texture2", "Input2", "Color2", "G"],
-        "Blue":  ["Texture3", "Input3", "B"],
+        "Red":   ["First channel", "Texture1", "Input1", "Color1", "R"],
+        "Green": ["Second channel", "Texture2", "Input2", "Color2", "G"],
+        "Blue":  ["Third channel", "Texture3", "Input3", "B"],
     },
     "ShaderNodeCombineRGB": {
-        "R": ["Texture1", "Input1", "Color1", "R"],
-        "G": ["Texture2", "Input2", "Color2", "G"],
-        "B": ["Texture3", "Input3", "B"],
+        "R": ["First channel", "Texture1", "Input1", "Color1", "R"],
+        "G": ["Second channel", "Texture2", "Input2", "Color2", "G"],
+        "B": ["Third channel", "Texture3", "Input3", "B"],
     },
     "ShaderNodeCombineXYZ": {
         "X": ["Texture1", "Input1", "Color1", "X"],
@@ -923,6 +992,11 @@ OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Fresnel": ["OutTex", "Texture out", "Output"],
         "Facing":  ["OutTex", "Texture out", "Output"],
     },
+    "ShaderNodeCameraData": {
+        "View Vector": ["View Vector"],
+        "View Z Depth": ["View Z Depth"],
+        "View Distance": ["View Distance"],
+    },
     "ShaderNodeVertexColor": {
         "Color": ["OutTex", "Texture out", "Output"],
         "Alpha": ["OutTex", "Texture out", "Output"],
@@ -935,6 +1009,9 @@ OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
     "ShaderNodeAmbientOcclusion": {
         "Color": ["OutTex", "Texture out", "Output"],
         "AO":    ["OutTex", "Texture out", "Output"],
+    },
+    "ShaderNodeBevel": {
+        "Normal": ["Round edges out", "Output"],
     },
     "ShaderNodeVolumeAbsorption": {
         "Volume": ["OutMedium", "Medium out", "Output"],
@@ -979,7 +1056,7 @@ OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Value": ["OutTex", "Texture out", "Output", "Value"],
     },
     "ShaderNodeBlackbody": {
-        "Color": ["OutTex", "Texture out", "Output", "Emission"],
+        "Color": ["Emission out", "OutEmission", "OutTex", "Texture out", "Output", "Emission"],
     },
     "ShaderNodeVolumePrincipled": {
         "Volume": ["OutMedium", "Medium out", "Output"],
@@ -1065,20 +1142,24 @@ def resolve_input_socket(
 
     type_map = INPUT_MAP.get(cycles_type, {})
 
-    # Strategy 1: exact name match via INPUT_MAP candidates
-    candidates = type_map.get(cycles_socket_name, [])
-    for cand in candidates:
-        sock = octane_node.inputs.get(cand)
-        if sock is not None:
-            return sock
-
-    # Strategy 2: try identifier-based lookup (disambiguates MixShader etc.)
+    # Strategy 1: prefer the unique identifier when it differs from the
+    # display name.  Blender gives duplicate sockets (for example the two
+    # Mix Shader inputs) the same display name but distinct identifiers.  If
+    # display-name candidates are tried first, both links resolve to the same
+    # Octane input and one branch is silently overwritten.
     if socket_identifier and socket_identifier != cycles_socket_name:
         id_candidates = type_map.get(socket_identifier, [])
         for cand in id_candidates:
             sock = octane_node.inputs.get(cand)
             if sock is not None:
                 return sock
+
+    # Strategy 2: exact name match via INPUT_MAP candidates
+    candidates = type_map.get(cycles_socket_name, [])
+    for cand in candidates:
+        sock = octane_node.inputs.get(cand)
+        if sock is not None:
+            return sock
 
     # Strategy 3: literal Cycles socket name
     sock = octane_node.inputs.get(cycles_socket_name)
@@ -1167,8 +1248,9 @@ def resolve_output_socket(
     if sock is not None:
         return sock
 
-    # Strategy 6: first output (texture/shader nodes usually have one main output)
-    if octane_node.outputs:
+    # Strategy 6: first output only when it is unambiguous.  Returning output
+    # zero from a multi-output node silently aliases channels such as R/G/B.
+    if len(octane_node.outputs) == 1:
         return octane_node.outputs[0]
 
     log.warning(
@@ -1182,13 +1264,121 @@ def resolve_output_socket(
     return None
 
 
-def create_octane_node(node_tree, cycles_type: str, label: str = ""):
+def get_contextual_node_candidates(
+    cycles_type: str,
+    analysis,
+    node_name: str,
+    outgoing_links=None,
+) -> list[str]:
+    """Return preferred Octane node candidates when link context matters.
+
+    Some Cycles node types are too broad to map correctly from the node type
+    alone. Image Texture is the important case: Octane has separate RGB,
+    greyscale, and alpha image nodes, and using the wrong one can break data
+    texture chains such as roughness, metallic, opacity, and displacement.
+    """
+    if cycles_type != "ShaderNodeTexImage" or analysis is None:
+        return []
+
+    outgoing = (
+        list(outgoing_links)
+        if outgoing_links is not None
+        else [link for link in analysis.links if link.from_node == node_name]
+    )
+    if not outgoing:
+        return []
+
+    alpha_inputs = {
+        "Alpha",
+        "Opacity",
+        "Opacity float",
+    }
+    data_inputs = {
+        "Metallic",
+        "Metallic float",
+        "Metalness",
+        "Roughness",
+        "Roughness float",
+        "Specular roughness",
+        "Displacement",
+        "Height",
+        "Midlevel",
+        "Mid level",
+        "Scale",
+        "Strength",
+        "Bump",
+        "Density",
+        "Amount",
+        "Factor",
+        "Fac",
+        "Value",
+        "Emission Strength",
+        "Emission power",
+        "Power",
+        "IOR",
+        "Dielectric IOR",
+        "Transmission",
+        "Transmission Weight",
+        "Transmission float",
+    }
+    color_inputs = {
+        "Base Color",
+        "Base color",
+        "Albedo",
+        "Albedo color",
+        "Diffuse",
+        "Color",
+        "Emission",
+        "Emission Color",
+        "Emission color",
+        "Reflection",
+        "Specular",
+        "Specular color",
+        "Texture",
+    }
+
+    feeds_alpha = False
+    feeds_data = False
+    feeds_color = False
+
+    for link in outgoing:
+        if link.from_socket == "Alpha" or link.to_socket in alpha_inputs:
+            feeds_alpha = True
+        if link.to_socket in data_inputs:
+            feeds_data = True
+        if link.to_socket in color_inputs:
+            feeds_color = True
+
+    # A single Cycles image can feed both Color and Alpha.  Prefer the RGB
+    # node in that case: selecting an alpha-only node would destroy every
+    # color connection.  Alpha extraction is handled separately by the
+    # conversion pipeline when the RGB node lacks a dedicated Alpha output.
+    if feeds_alpha and feeds_color:
+        return ["OctaneRGBImage", "ShaderNodeOctImageTex", "OctaneImageTexture"]
+    if feeds_alpha:
+        return ["OctaneAlphaImage", "ShaderNodeOctAlphaImage", "OctaneRGBImage"]
+    if feeds_data and not feeds_color:
+        return ["OctaneGreyscaleImage", "ShaderNodeOctGreyscaleImage", "OctaneRGBImage"]
+    return ["OctaneRGBImage", "ShaderNodeOctImageTex", "OctaneImageTexture"]
+
+
+def create_octane_node(
+    node_tree,
+    cycles_type: str,
+    label: str = "",
+    preferred_candidates: list[str] | None = None,
+):
     """Try to create an Octane node using candidates list. Returns node or None."""
     from ..utils.logger import get_logger
     import bpy
     log = get_logger()
 
-    candidates = NODE_TYPE_MAP.get(cycles_type, [])
+    base_candidates = NODE_TYPE_MAP.get(cycles_type, [])
+    preferred_candidates = preferred_candidates or []
+    candidates = []
+    for idname in [*preferred_candidates, *base_candidates]:
+        if idname not in candidates:
+            candidates.append(idname)
     
     # ── User Preferences Interception ──
     try:
@@ -1209,6 +1399,18 @@ def create_octane_node(node_tree, cycles_type: str, label: str = ""):
     except Exception:
         pass
 
+    return create_node_from_candidates(node_tree, candidates, label=label)
+
+
+def create_node_from_candidates(
+    node_tree,
+    candidates: list[str] | tuple[str, ...],
+    label: str = "",
+):
+    """Create the first available node from an explicit candidate list."""
+    from ..utils.logger import get_logger
+    log = get_logger()
+
     for idname in candidates:
         try:
             new_node = node_tree.nodes.new(type=idname)
@@ -1218,5 +1420,5 @@ def create_octane_node(node_tree, cycles_type: str, label: str = ""):
         except (RuntimeError, TypeError, KeyError):
             continue
 
-    log.warning("No Octane equivalent found for Cycles node type '%s'", cycles_type)
+    log.warning("No available node found from candidates: %s", list(candidates))
     return None

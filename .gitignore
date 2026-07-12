@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 .DS_Store
 *.zip
+tests/
+MATERIAL_FIDELITY.md
+NODE_SUPPORT.md
