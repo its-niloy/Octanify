@@ -4,5 +4,6 @@ __pycache__/
 .DS_Store
 *.zip
 tests/
+tools/
 MATERIAL_FIDELITY.md
 NODE_SUPPORT.md
