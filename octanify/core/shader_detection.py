@@ -216,7 +216,7 @@ _PROPERTY_KEYS: dict[str, list[str]] = {
 
 def _snapshot_properties(node: bpy.types.Node, info: NodeInfo) -> None:
     """Capture important Cycles node properties into the info dict."""
-    for key in ("mute", "hide"):
+    for key in ("mute", "hide", "is_active_output"):
         if hasattr(node, key):
             info.properties[key] = bool(getattr(node, key))
 
@@ -339,7 +339,10 @@ def analyze_tree(node_tree: bpy.types.NodeTree) -> TreeAnalysis:
             # BUG 2 FIX: Also detect emission when driven by a texture link,
             # not just a non-zero default_value. Without this, any Principled
             # BSDF with a texture-driven emission silently loses it on convert.
-            em_input = node.inputs.get("Emission Color")
+            em_input = (
+                node.inputs.get("Emission Color")
+                or node.inputs.get("Emission")
+            )
             em_str_input = node.inputs.get("Emission Strength")
             if em_input is not None:
                 has_em_link = len(em_input.links) > 0
@@ -394,6 +397,18 @@ def analyze_tree(node_tree: bpy.types.NodeTree) -> TreeAnalysis:
 
         if bid in ("ShaderNodeBsdfMetallic", "ShaderNodeBsdfSheen", "ShaderNodeBsdfToon", "ShaderNodeBsdfHair", "ShaderNodeBsdfHairPrincipled"):
             pass  # Future proofing for specialized flags if needed
+
+    # Blender may select an explicit CYCLES output even when another
+    # renderer's output is globally active. Record Blender's own resolution
+    # result so conversion follows the Cycles render branch exactly.
+    try:
+        cycles_output = node_tree.get_output_node("CYCLES")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        cycles_output = None
+    if cycles_output is not None and cycles_output.name in analysis.nodes:
+        analysis.nodes[cycles_output.name].properties[
+            "octanify_cycles_output"
+        ] = True
 
     # ── Snapshot links (flatten reroutes + transparents, deduplicate) ─────
     seen_links: set[tuple[str, str, str, str]] = set()

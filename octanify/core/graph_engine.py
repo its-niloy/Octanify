@@ -11,7 +11,7 @@ conversion engine.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from .node_registry import (
     NODE_TYPE_MAP,
@@ -39,10 +39,12 @@ class GraphEngine:
         analysis: "TreeAnalysis",
         group_converter_cb=None,
         context_name: str = "",
+        reuse_output_nodes: bool = True,
     ) -> None:
         self.analysis = analysis
         self.group_converter_cb = group_converter_cb
         self.context_name = context_name
+        self.reuse_output_nodes = reuse_output_nodes
         # Ordered list of node names to convert (dependencies first)
         self._schedule: list[str] = []
         self._visited: set[str] = set()
@@ -57,6 +59,21 @@ class GraphEngine:
         # appropriate variant.
         self._created_variants: dict[str, list["bpy.types.Node"]] = {}
         self._output_variants: dict[tuple[str, str], "bpy.types.Node"] = {}
+        selected_cycles_outputs = {
+            name
+            for name, info in self.analysis.nodes.items()
+            if info.bl_idname == "ShaderNodeOutputMaterial"
+            and bool(
+                getattr(info, "properties", {}).get("octanify_cycles_output")
+            )
+        }
+        active_outputs = {
+            name
+            for name, info in self.analysis.nodes.items()
+            if info.bl_idname == "ShaderNodeOutputMaterial"
+            and bool(getattr(info, "properties", {}).get("is_active_output"))
+        }
+        self._active_material_outputs = selected_cycles_outputs or active_outputs
         self._build_dependency_graph()
 
     # -----------------------------------------------------------------
@@ -186,6 +203,16 @@ class GraphEngine:
             or node_map.get(link_info.from_node)
         )
 
+    def is_skipped_material_output(self, node_name: str) -> bool:
+        """Return whether an inactive duplicate output was intentionally omitted."""
+        info = self.analysis.nodes.get(node_name)
+        return bool(
+            self._active_material_outputs
+            and info is not None
+            and info.bl_idname == "ShaderNodeOutputMaterial"
+            and node_name not in self._active_material_outputs
+        )
+
     def _expand_channel_split(
         self,
         target_tree: "bpy.types.NodeTree",
@@ -295,7 +322,9 @@ class GraphEngine:
         return primary
 
     def create_nodes(
-        self, target_tree: "bpy.types.NodeTree"
+        self,
+        target_tree: "bpy.types.NodeTree",
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> dict[str, "bpy.types.Node"]:
         """
         Create Octane nodes in *target_tree* following the computed schedule.
@@ -304,7 +333,10 @@ class GraphEngine:
         schedule = self.compute_schedule()
         node_map: dict[str, "bpy.types.Node"] = {}
 
-        for node_name in schedule:
+        total = len(schedule)
+        for index, node_name in enumerate(schedule):
+            if progress_callback is not None:
+                progress_callback(index, total, node_name)
             info = self.analysis.nodes.get(node_name)
             if info is None:
                 continue
@@ -323,19 +355,36 @@ class GraphEngine:
                 continue
 
             if bl_id in PASSTHROUGH_TYPES:
-                # For output material, reuse or create
+                # Octane material trees intentionally use Blender's Material
+                # Output. In smart mode the original output is CYCLES-only
+                # and this converted output stays ALL, which is the fallback
+                # selected by Octane's get_output_node("octane") lookup.
                 if bl_id == "ShaderNodeOutputMaterial":
-                    existing = target_tree.nodes.get(node_name)
+                    if self.is_skipped_material_output(node_name):
+                        continue
+                    existing = (
+                        target_tree.nodes.get(node_name)
+                        if self.reuse_output_nodes
+                        else None
+                    )
                     if (existing is not None
                             and existing.bl_idname != "ShaderNodeOutputMaterial"):
                         existing = None
                     if existing is None:
-                        existing = target_tree.nodes.new("ShaderNodeOutputMaterial")
+                        existing = target_tree.nodes.new(
+                            "ShaderNodeOutputMaterial"
+                        )
                         existing.name = node_name
-                    # Set target to Octane
                     try:
-                        existing.target = "octane"
+                        existing.target = "ALL"
                     except (AttributeError, TypeError):
+                        pass
+                    try:
+                        # This is the sole selected render branch in a copied
+                        # material. Smart conversion restores the authored
+                        # graph's global activity after node creation.
+                        existing.is_active_output = True
+                    except (AttributeError, RuntimeError, TypeError):
                         pass
                     existing.location = info.location
                     self._apply_common_state(existing, info)
@@ -369,7 +418,7 @@ class GraphEngine:
                 label=info.label,
                 preferred_candidates=preferred_candidates,
             )
-            
+
             if new_node is not None:
                 new_node.location = info.location
                 self._apply_common_state(new_node, info)
@@ -377,7 +426,7 @@ class GraphEngine:
                     target_tree, node_name, info, new_node
                 )
                 node_map[node_name] = new_node
-                
+
                 from .report import report_data
                 report_data.nodes_translated += 1
                 approximation = APPROXIMATION_NOTES.get(info.bl_idname)
@@ -391,7 +440,7 @@ class GraphEngine:
                 mat_name = self.context_name or target_tree.name
                 short_type = info.bl_idname.replace('ShaderNode', '')
                 report_data.add_unsupported(f"[{mat_name}] Unsupported: {short_type}")
-                
+
                 try:
                     fallback = target_tree.nodes.new("ShaderNodeOctRGBColorTex")
                     fallback.label = f"[UNSUPPORTED] {info.label}"
@@ -410,4 +459,6 @@ class GraphEngine:
                     except Exception:
                         log.error("Cannot create fallback node for '%s'", node_name)
 
+        if progress_callback is not None:
+            progress_callback(total, total, "Node creation complete")
         return node_map

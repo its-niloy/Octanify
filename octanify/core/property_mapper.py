@@ -7,9 +7,10 @@ newly created Octane node.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
-from .node_registry import INPUT_MAP, MATH_OPERATION_MAP
+from .node_registry import INPUT_MAP, MATH_OPERATION_MAP, is_standard_surface_node
 from ..utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -185,6 +186,95 @@ def transfer_properties(
 # ---------------------------------------------------------------------------
 
 def _transfer_principled(info: "NodeInfo", node: "bpy.types.Node") -> None:
+    """Map Principled BSDF using the semantics of the actual target node."""
+    if is_standard_surface_node(node):
+        _transfer_principled_standard_surface(info, node)
+    else:
+        _transfer_principled_universal(info, node)
+
+
+def _transfer_principled_standard_surface(
+    info: "NodeInfo",
+    node: "bpy.types.Node",
+) -> None:
+    """Principled BSDF -> Standard Surface with one-to-one PBR layers.
+
+    Unlike Universal Material, Standard Surface exposes independent weights
+    and colours for the base, specular, transmission, coating, sheen, and
+    subsurface lobes.  Keeping those controls separate avoids enabling glossy
+    layers merely because a white tint is present in the Cycles node.
+    """
+    direct_transfers = [
+        (("Base Color",), "Base color"),
+        (("Diffuse Roughness",), "Diffuse roughness"),
+        (("Metallic",), "Metalness"),
+        (("Roughness",), "Specular roughness"),
+        (("IOR",), "Specular IOR"),
+        (("Anisotropic",), "Specular anisotropy"),
+        (("Anisotropic Rotation",), "Specular rotation"),
+        (("Transmission Weight", "Transmission"), "Transmission weight"),
+        (("Alpha",), "Opacity"),
+        (("Coat Weight", "Clearcoat"), "Coating weight"),
+        (("Coat Tint",), "Coating color"),
+        (("Coat Roughness", "Clearcoat Roughness"), "Coating roughness"),
+        (("Coat IOR",), "Coating IOR"),
+        (("Sheen Weight", "Sheen"), "Sheen weight"),
+        (("Sheen Tint",), "Sheen color"),
+        (("Sheen Roughness",), "Sheen roughness"),
+        (("Subsurface Weight", "Subsurface"), "Subsurface weight"),
+        (("Subsurface Radius",), "Subsurface radius"),
+        (("Subsurface Scale",), "Subsurface scale"),
+        (("Subsurface Anisotropy",), "Subsurface anisotropy"),
+        (("Thin Film Thickness",), "Film thickness (nm)"),
+        (("Thin Film IOR",), "Film IOR"),
+    ]
+    for cycles_names, octane_name in direct_transfers:
+        value = next(
+            (
+                candidate
+                for name in cycles_names
+                if (candidate := _get_input_value(info, name)) is not None
+            ),
+            None,
+        )
+        if value is not None:
+            _set_input(node, [octane_name], value)
+
+    # Standard Surface defaults this to 0.8, while pre-Blender-4 Principled
+    # nodes had no exposed Base Weight and behaved as 1.0.
+    _set_input(
+        node,
+        ["Base weight"],
+        _get_input_value(info, "Base Weight", 1.0),
+    )
+
+    # Blender's 0.5 Principled default represents the normal dielectric
+    # response.  Both OTOY's Universal converter and Standard Surface's 1.0
+    # default use twice that scale.
+    specular_level = _get_input_value(info, "Specular IOR Level")
+    if specular_level is None:
+        specular_level = _get_input_value(info, "Specular")
+    if isinstance(specular_level, (int, float)):
+        _set_input(node, ["Specular weight"], specular_level * 2.0)
+
+    base_color = _get_input_value(info, "Base Color")
+    if base_color is not None:
+        # Cycles uses Base Color for transmission and subsurface tint too.
+        # These Standard Surface lobes are inactive at zero weight, so setting
+        # their tint is safe and remains correct when a weight is textured.
+        _set_input(node, ["Transmission color"], base_color)
+        _set_input(node, ["Subsurface color"], base_color)
+
+    specular_tint = _get_input_value(info, "Specular Tint")
+    if specular_tint is not None:
+        if isinstance(specular_tint, (int, float)) and base_color is not None:
+            base = list(base_color)[:3]
+            tint = float(specular_tint)
+            specular_tint = tuple(1.0 + (channel - 1.0) * tint for channel in base)
+        _set_input(node, ["Specular color"], specular_tint)
+
+
+def _transfer_principled_universal(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Principled BSDF → Universal Material without corrupting layer defaults.
 
     Universal's Coating and Sheen inputs encode coloured layer strength;
@@ -193,6 +283,11 @@ def _transfer_principled(info: "NodeInfo", node: "bpy.types.Node") -> None:
     interchangeable was the root cause of default Principled nodes becoming
     perfectly smooth, fully coated materials.
     """
+
+    # Octane Universal defaults to its legacy "Octane" lobe. Cycles
+    # Principled uses a GGX microfacet response, so leaving the fresh-node
+    # default here changes highlight shape and perceived roughness.
+    _set_input(node, ["BSDF model", "BRDF model"], "GGX")
 
     # Only semantically equivalent socket values belong in this direct list.
     _simple_transfers = [
@@ -216,21 +311,33 @@ def _transfer_principled(info: "NodeInfo", node: "bpy.types.Node") -> None:
     # equivalent Universal Specular channel defaults to 1.0.  OTOY's own
     # converter applies this factor of two as well.
     specular_level = _get_input_value(info, "Specular IOR Level")
+    if specular_level is None:
+        specular_level = _get_input_value(info, "Specular")
     if isinstance(specular_level, (int, float)):
         _set_input(node, ["Specular", "Specular float"], specular_level * 2.0)
 
     # Cycles weight × tint corresponds to Octane's coloured layer strength.
-    coat_weight = _get_input_value(info, "Coat Weight", 0.0)
+    coat_weight = _get_input_value(info, "Coat Weight")
+    if coat_weight is None:
+        coat_weight = _get_input_value(info, "Clearcoat", 0.0)
     coat_tint = _get_input_value(info, "Coat Tint", (1.0, 1.0, 1.0, 1.0))
     _set_input(node, ["Coating", "Coating color"],
                _weighted_color(coat_tint, coat_weight))
     if isinstance(coat_weight, (int, float)) and coat_weight > 0.0:
-        _set_input(node, ["Coating roughness", "Coating roughness float"],
-                   _get_input_value(info, "Coat Roughness", 0.03))
+        coat_roughness = _get_input_value(info, "Coat Roughness")
+        if coat_roughness is None:
+            coat_roughness = _get_input_value(info, "Clearcoat Roughness", 0.03)
+        _set_input(
+            node,
+            ["Coating roughness", "Coating roughness float"],
+            coat_roughness,
+        )
         _set_input(node, ["Coating IOR"],
                    _get_input_value(info, "Coat IOR", 1.5))
 
-    sheen_weight = _get_input_value(info, "Sheen Weight", 0.0)
+    sheen_weight = _get_input_value(info, "Sheen Weight")
+    if sheen_weight is None:
+        sheen_weight = _get_input_value(info, "Sheen", 0.0)
     sheen_tint = _get_input_value(info, "Sheen Tint", (1.0, 1.0, 1.0, 1.0))
     _set_input(node, ["Sheen", "Sheen color"],
                _weighted_color(sheen_tint, sheen_weight))
@@ -267,7 +374,7 @@ def _transfer_glass(info: "NodeInfo", node: "bpy.types.Node") -> None:
                _get_input_value(info, "Roughness", 0.0))
     _set_input(node, ["Index", "IOR", "Dielectric IOR"],
                _get_input_value(info, "IOR", 1.45))
-    # Enable fake shadows and GGX
+    # Transparent shadow approximation for dedicated glass materials.
     _set_prop(node, "fake_shadows", True)
 
 
@@ -354,14 +461,14 @@ def _transfer_image_texture(info: "NodeInfo", node: "bpy.types.Node") -> None:
 
     # Colorspace → gamma
     cs = info.properties.get("colorspace", "sRGB")
-    
+
     # Comprehensive linear space detection matching Blender's internal colormanagement
     linear_spaces = {
-        "Non-Color", "Linear", "Raw", "Utility - Linear - sRGB", 
+        "Non-Color", "Linear", "Raw", "Utility - Linear - sRGB",
         "Utility - Raw", "Linear ACES", "Utility - Linear - Rec.709"
     }
     is_linear = cs in linear_spaces or cs.lower().startswith("linear")
-    
+
     if is_linear:
         # Set gamma to 1.0 (linear)
         _set_input(node, ["Legacy gamma", "Gamma", "Power"], 1.0)
@@ -444,7 +551,7 @@ def _transfer_displacement(info: "NodeInfo", node: "bpy.types.Node") -> None:
             }
             lod_value = lod_dict.get(lod_value, lod_value)
             _set_input(node, ["Level of detail"], lod_value)
-        
+
         pref_mid = getattr(scene, "octanify_disp_mid_level", 0.5)
         if pref_mid != 0.5:
             _set_input(node, ["Mid level", "Mid Level"], pref_mid)
@@ -458,8 +565,13 @@ def _transfer_mapping(info: "NodeInfo", node: "bpy.types.Node") -> None:
     rot = _get_input_value(info, "Rotation", (0.0, 0.0, 0.0))
     scl = _get_input_value(info, "Scale", (1.0, 1.0, 1.0))
 
+    # Blender stores Mapping rotations in radians. Octane's generated 3D
+    # Transformation socket is a raw degree vector and defaults to YXZ, so a
+    # direct copy changes both units and Euler order.
+    rotation_degrees = tuple(math.degrees(float(angle)) for angle in rot)
+    _set_input(node, ["Rotation order"], "XYZ")
     _set_input(node, ["Translation", "Position", "Location"], loc)
-    _set_input(node, ["Rotation", "Rotation"], rot)
+    _set_input(node, ["Rotation"], rotation_degrees)
     _set_input(node, ["Scale", "Scaling"], scl)
 
 
@@ -480,7 +592,7 @@ def _transfer_mix_rgb(info: "NodeInfo", node: "bpy.types.Node") -> None:
     use_clamp = info.properties.get("use_clamp", False)
     _set_input(node, ["Clamp Result(Int)"], 1 if use_clamp else 0)
     _set_input(node, ["Clamp Result"], use_clamp)
-    
+
     blend_type = info.properties.get("blend_type", "MIX")
     oct_blend_type = MIX_BLEND_TYPE_MAP.get(blend_type, "Mix")
     _set_input(node, ["Blend Type"], oct_blend_type)
@@ -505,11 +617,11 @@ def _transfer_mix(info: "NodeInfo", node: "bpy.types.Node") -> None:
     blend_type = info.properties.get("blend_type", "MIX")
     oct_blend_type = MIX_BLEND_TYPE_MAP.get(blend_type, "Mix")
     _set_input(node, ["Blend Type"], oct_blend_type)
-    
+
     clamp_result = info.properties.get("clamp_result", False)
     _set_input(node, ["Clamp Result(Int)"], 1 if clamp_result else 0)
     _set_input(node, ["Clamp Result"], clamp_result)
-    
+
     clamp_factor = info.properties.get("clamp_factor", False)
     _set_input(node, ["Clamp Factor(Int)"], 1 if clamp_factor else 0)
     _set_input(node, ["Clamp Factor"], clamp_factor)
@@ -862,7 +974,7 @@ def _transfer_vector_math(info: "NodeInfo", node: "bpy.types.Node") -> None:
     v1 = _get_input_value(info, "Vector")
     if v1 is not None:
         _set_input(node, ["Texture1", "Color1", "Input1", "A"], v1)
-    
+
     v2 = _get_input_value(info, "Vector_001")
     if v2 is None:
         vals = [v for k, v in info.inputs.items() if k.startswith("Vector")]
@@ -870,7 +982,7 @@ def _transfer_vector_math(info: "NodeInfo", node: "bpy.types.Node") -> None:
             v2 = vals[1]
     if v2 is not None:
         _set_input(node, ["Texture2", "Color2", "Input2", "B"], v2)
-    
+
     s = _get_input_value(info, "Scale")
     if s is not None:
         _set_input(node, ["Amount", "Factor", "Value2", "B"], s)

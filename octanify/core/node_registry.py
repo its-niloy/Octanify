@@ -6,6 +6,17 @@ plus socket-level input/output maps for link reconstruction.
 
 from __future__ import annotations
 
+
+STANDARD_SURFACE_NODE_TYPES = frozenset({
+    "OctaneStandardSurfaceMaterial",
+    "ShaderNodeOctStandardSurfaceMat",
+})
+
+
+def is_standard_surface_node(node) -> bool:
+    """Return whether *node* is an Octane Standard Surface material."""
+    return getattr(node, "bl_idname", "") in STANDARD_SURFACE_NODE_TYPES
+
 # ---------------------------------------------------------------------------
 # Node type map: Cycles bl_idname → list of Octane bl_idname candidates
 # The first candidate that succeeds at runtime is used.
@@ -14,8 +25,8 @@ from __future__ import annotations
 NODE_TYPE_MAP: dict[str, list[str]] = {
     # ── Shaders ──────────────────────────────────────────────────────────
     "ShaderNodeBsdfPrincipled": [
-        "ShaderNodeOctUniversalMat",
         "OctaneUniversalMaterial",
+        "ShaderNodeOctUniversalMat",
     ],
     "ShaderNodeBsdfGlass": [
         "ShaderNodeOctSpecularMat",
@@ -46,21 +57,22 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneSpecularMaterial",
     ],
     "ShaderNodeMixShader": [
-        "ShaderNodeOctMixMat",
         "OctaneMixMaterial",
+        "ShaderNodeOctMixMat",
     ],
     "ShaderNodeAddShader": [
-        "ShaderNodeOctMixMat",
         "OctaneMixMaterial",
+        "ShaderNodeOctMixMat",
     ],
     "ShaderNodeBsdfMetallic": [
         "ShaderNodeOctMetallicMat",
         "OctaneMetallicMaterial",
+        "OctaneUniversalMaterial",
         "ShaderNodeOctUniversalMat",
     ],
     "ShaderNodeBsdfSheen": [
-        "ShaderNodeOctUniversalMat",
         "OctaneUniversalMaterial",
+        "ShaderNodeOctUniversalMat",
     ],
     "ShaderNodeBsdfToon": [
         "ShaderNodeOctToonMat",
@@ -69,11 +81,13 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
     "ShaderNodeBsdfHair": [
         "ShaderNodeOctHairMat",
         "OctaneHairMaterial",
+        "OctaneUniversalMaterial",
         "ShaderNodeOctUniversalMat",
     ],
     "ShaderNodeBsdfHairPrincipled": [
         "ShaderNodeOctHairMat",
         "OctaneHairMaterial",
+        "OctaneUniversalMaterial",
         "ShaderNodeOctUniversalMat",
     ],
     "ShaderNodeBsdfRayPortal": [
@@ -83,8 +97,8 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneNullMaterial",
     ],
     "ShaderNodeSubsurfaceScattering": [
-        "ShaderNodeOctUniversalMat",
         "OctaneUniversalMaterial",
+        "ShaderNodeOctUniversalMat",
     ],
     "ShaderNodeBackground": [
         "ShaderNodeOctDiffuseMat",
@@ -240,12 +254,12 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneTransform3D",
     ],
     "ShaderNodeTexCoord": [
-        "ShaderNodeOctMeshUVProjection",
         "OctaneMeshUVProjection",
+        "ShaderNodeOctMeshUVProjection",
     ],
     "ShaderNodeUVMap": [
-        "ShaderNodeOctMeshUVProjection",
         "OctaneMeshUVProjection",
+        "ShaderNodeOctMeshUVProjection",
     ],
     "ShaderNodeNormalMap": [
         "ShaderNodeOctNormalMapTex",
@@ -563,30 +577,44 @@ MATH_OPERATION_MAP: dict[str, str] = {
 
 INPUT_MAP: dict[str, dict[str, list[str]]] = {
     "ShaderNodeBsdfPrincipled": {
-        "Base Color":           ["Albedo color", "Albedo", "Diffuse", "Base color"],
+        "Base Weight":          ["Base weight"],
+        "Base Color":           ["Base color", "Albedo color", "Albedo", "Diffuse"],
+        "Diffuse Roughness":    ["Diffuse roughness"],
         "Metallic":             ["Metallic", "Metallic float", "Metalness"],
         "Roughness":            ["Roughness", "Roughness float", "Specular roughness"],
-        "Specular IOR Level":   ["Specular", "Specular float"],
+        "Specular IOR Level":   ["Specular weight", "Specular", "Specular float"],
+        "Specular":             ["Specular weight", "Specular", "Specular float"],
+        "Specular Tint":        ["Specular color"],
         "IOR":                  ["Dielectric IOR", "Index", "IOR", "Specular IOR"],
-        "Transmission Weight":  ["Transmission", "Transmission float"],
+        "Transmission Weight":  ["Transmission weight", "Transmission", "Transmission float"],
+        "Transmission":         ["Transmission weight", "Transmission", "Transmission float"],
         "Alpha":                ["Opacity", "Opacity float"],
         "Normal":               ["Normal", "Bump", "ShaderNormal"],
         # Octane's Coating and Sheen sockets are layer colours rather than
         # scalar weights.  Weight × tint is assembled by a dedicated graph
         # pass; mapping either input directly enables the layer at full power.
-        "Coat Weight":          ["Coating", "Coating float"],
+        "Coat Weight":          ["Coating weight", "Coating", "Coating float"],
+        "Clearcoat":            ["Coating weight", "Coating", "Coating float"],
         "Coat Roughness":       ["Coating roughness", "Coating roughness float"],
+        "Clearcoat Roughness":  ["Coating roughness", "Coating roughness float"],
         "Coat Normal":          ["Coating normal", "Coating bump"],
+        "Clearcoat Normal":     ["Coating normal", "Coating bump"],
         "Coat IOR":             ["Coating IOR"],
-        "Coat Tint":            ["Coating", "Coating color"],
-        "Sheen Weight":         ["Sheen", "Sheen float"],
+        "Coat Tint":            ["Coating color", "Coating"],
+        "Sheen Weight":         ["Sheen weight", "Sheen", "Sheen float"],
+        "Sheen":                ["Sheen weight", "Sheen", "Sheen float"],
         "Sheen Roughness":      ["Sheen roughness", "Sheen roughness float"],
-        "Sheen Tint":           ["Sheen", "Sheen color", "Sheen tint"],
+        "Sheen Tint":           ["Sheen color", "Sheen", "Sheen tint"],
         "Emission Color":       ["Emission", "Emission color"],
         "Emission Strength":    ["Emission power", "Emission weight"],
-        "Anisotropic":          ["Anisotropy", "Anisotropy float"],
-        "Anisotropic Rotation": ["Anisotropy rotation", "Rotation"],
-        "Thin Film Thickness":  ["Film width", "Thin film thickness"],
+        "Anisotropic":          ["Specular anisotropy", "Anisotropy", "Anisotropy float"],
+        "Anisotropic Rotation": ["Specular rotation", "Anisotropy rotation", "Rotation"],
+        "Subsurface Weight":    ["Subsurface weight"],
+        "Subsurface":           ["Subsurface weight"],
+        "Subsurface Radius":    ["Subsurface radius"],
+        "Subsurface Scale":     ["Subsurface scale"],
+        "Subsurface Anisotropy": ["Subsurface anisotropy"],
+        "Thin Film Thickness":  ["Film thickness (nm)", "Film width", "Thin film thickness"],
         "Thin Film IOR":        ["Film IOR", "Thin film IOR"],
     },
     "ShaderNodeBsdfGlass": {
@@ -622,15 +650,17 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
     "ShaderNodeMixShader": {
         "Fac":    ["Amount", "Factor"],
         # Octane swaps shader order: Cycles slot 1 → Octane slot 2
-        "Shader": ["Material1", "Shader1"],
-        "Shader_001": ["Material2", "Shader2"],
+        "Shader": ["First material", "Material1", "Shader1"],
+        "Shader_001": ["Second material", "Material2", "Shader2"],
     },
     "ShaderNodeAddShader": {
-        "Shader":     ["Material1", "Shader1"],
-        "Shader_001": ["Material2", "Shader2"],
+        "Shader":     ["First material", "Material1", "Shader1"],
+        "Shader_001": ["Second material", "Material2", "Shader2"],
     },
     "ShaderNodeTexImage": {
-        "Vector": ["Transform", "Projection", "UV", "UVTransform"],
+        # The source node decides which pin is correct during reconstruction:
+        # coordinates feed Projection; Mapping feeds UV transform.
+        "Vector": ["Projection", "UV transform", "Transform", "UVTransform", "UV"],
     },
     "ShaderNodeTexNoise": {
         "Vector": ["Transform", "UVTransform"],
@@ -1019,7 +1049,7 @@ OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
     "ShaderNodeVolumeScatter": {
         "Volume": ["OutMedium", "Medium out", "Output"],
     },
-    
+
     # ── New Nodes ────────────────────────────────────────────────────────
     "ShaderNodeBsdfMetallic": {
         "BSDF": ["OutMat", "Material out", "Output"],
@@ -1379,15 +1409,15 @@ def create_octane_node(
     for idname in [*preferred_candidates, *base_candidates]:
         if idname not in candidates:
             candidates.append(idname)
-    
+
     # ── User Preferences Interception ──
     try:
         scene = bpy.context.scene
         if cycles_type == "ShaderNodeBsdfPrincipled":
-            if getattr(scene, "octanify_base_material", "UNIVERSAL") == "STANDARD_SURFACE":
+            if getattr(scene, "octanify_base_material", "STANDARD_SURFACE") == "STANDARD_SURFACE":
                 candidates = [
+                    "OctaneStandardSurfaceMaterial",
                     "ShaderNodeOctStandardSurfaceMat",
-                    "OctaneStandardSurfaceMaterial"
                 ] + candidates
 
         elif cycles_type == "ShaderNodeDisplacement":

@@ -115,13 +115,11 @@ def handle_volumetrics(
         )
 
         if medium_input is None:
-            # A volume-only material may still be accepted by an Octane-aware
-            # Material Output.  Link reconstruction already attempted that
-            # route, so retain it and issue a precise warning for review.
             material_name = material_node.name if material_node is not None else "<none>"
             report_data.add_warning(
                 f"[{target_tree.name}] Surface '{material_name}' has no Medium input; "
-                f"kept '{volume_link.from_node}' on Material Output.Volume"
+                f"cannot attach volume '{volume_link.from_node}' to the native "
+                "Octane Material Output"
             )
             continue
 

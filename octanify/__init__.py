@@ -18,7 +18,7 @@ from __future__ import annotations
 bl_info = {
     "name": "Octanify",
     "author": "Niloy Bhowmick",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Octanify",
     "description": "Convert Cycles materials to Octane materials with one click",
@@ -39,10 +39,58 @@ def _register_properties() -> None:
         name="Batch Mode",
         description="Which objects to convert",
         items=[
-            ("ACTIVE", "Active Object", "Convert only the active object's materials"),
-            ("ALL", "All Objects", "Convert all materials across all scene objects"),
+            (
+                "ACTIVE",
+                "Active Object",
+                "Convert selected objects and the active object's descendants",
+            ),
+            (
+                "ALL",
+                "Entire Scene",
+                "Convert every material used by objects in the scene",
+            ),
         ],
         default="ACTIVE",
+    )
+
+    bpy.types.Scene.octanify_smart_conversion = bpy.props.BoolProperty(
+        name="Smart Conversion",
+        description=(
+            "Keep the original Cycles graph and append a separate, "
+            "renderer-targeted Octane graph to the same material"
+        ),
+        default=True,
+        options={"HIDDEN"},
+    )
+
+    bpy.types.Scene.octanify_auto_arrange = bpy.props.BoolProperty(
+        name="Auto Arrange Node Trees",
+        description=(
+            "Arrange and visually separate the Cycles and Octane graphs "
+            "after conversion"
+        ),
+        default=True,
+        options={"HIDDEN"},
+    )
+
+    bpy.types.Scene.octanify_progress = bpy.props.IntProperty(
+        name="Conversion Progress",
+        default=0,
+        min=0,
+        max=100,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    bpy.types.Scene.octanify_progress_label = bpy.props.StringProperty(
+        name="Conversion Progress Label",
+        default="Ready",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    bpy.types.Scene.octanify_progress_active = bpy.props.BoolProperty(
+        name="Conversion Progress Active",
+        default=False,
+        options={"HIDDEN", "SKIP_SAVE"},
     )
 
     bpy.types.Scene.octanify_albedo_gamma = bpy.props.FloatProperty(
@@ -56,13 +104,21 @@ def _register_properties() -> None:
     )
 
     bpy.types.Scene.octanify_base_material = bpy.props.EnumProperty(
-        name="Target Material",
-        description="Base material to use for Principled BSDF conversions",
+        name="Octane Material Type",
+        description="Octane material node created from each Cycles Principled BSDF",
         items=[
-            ("UNIVERSAL", "Universal Material", "Highly flexible, standard Octane material"),
-            ("STANDARD_SURFACE", "Standard Surface", "Good for standard PBR workflows"),
+            (
+                "STANDARD_SURFACE",
+                "Standard Surface (Recommended)",
+                "Closest semantic match to Cycles Principled BSDF and the fidelity-first default",
+            ),
+            (
+                "UNIVERSAL",
+                "Universal Material",
+                "Octane-native material with compatibility mappings for Principled layers",
+            ),
         ],
-        default="UNIVERSAL",
+        default="STANDARD_SURFACE",
     )
 
     bpy.types.Scene.octanify_disp_mode = bpy.props.EnumProperty(
@@ -101,6 +157,11 @@ def _register_properties() -> None:
 def _unregister_properties() -> None:
     for name in (
         "octanify_batch_mode",
+        "octanify_smart_conversion",
+        "octanify_auto_arrange",
+        "octanify_progress",
+        "octanify_progress_label",
+        "octanify_progress_active",
         "octanify_albedo_gamma",
         "octanify_base_material",
         "octanify_disp_mode",

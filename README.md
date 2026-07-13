@@ -23,118 +23,86 @@
 
 ## <a id="the-interface"></a>🖥️ The Interface
 
-Once installed, press `N` in the 3D Viewport or Shader Editor to open the sidebar and find the **Octanify** tab. It matches this layout perfectly:
+Once installed, press `N` in the 3D Viewport or Shader Editor and open the **Octanify** tab. The interface uses a compact control-deck layout: conversion stays at the top, common material and node tools remain immediately accessible, and advanced details start collapsed.
 
 ```text
-┌──────────────────────────────────────────────┐
-│ ▼ Octanify                                   │
-├──────────────────────────────────────────────┤
-│ █▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀█ │
-│ █            CONVERT TO OCTANE             █ │
-│ █▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄█ │
-│   [ ↺ Revert to Cycles                     ] │
-│                                              │
-│ ▼ Batch Object Conversion:                   │
-│   [ ◉ Active Object ]    [ ○ All Objects ]   │
-│                                              │
-│ ▼ Albedo Gamma & Update Tools:               │
-│   Albedo Gamma    <────────[ 2.20 ]────────> │
-│   [ 🖌️ Update Selected Material            ] │
-│   [ 🌍 Update All Materials                ] │
-│                                              │
-│ ▼ Conversion Settings:                       │
-│   Target Material [ Universal Material   ▼ ] │
-│   Displacement:                              │
-│   [ ◉ Texture ]          [ ○ Vertex ]        │
-│   Level of Detail [ 2048x2048            ▼ ] │
-│   Mid Level       <────────[ 0.50 ]────────> │
-│                                              │
-│ ▼ Utilities:                                 │
-│   [ 👁️ Preview Node in Viewport           ] │
-│   [ 🆕 Create Basic Material              ] │
-│   [ 🔗 Auto-Connect Textures              ] │
-│                                              │
-│ ▼ Last Conversion Report:                    │
-│   [ ℹ️ Materials Converted: 10             ] │
-│   [ 🗃️ Nodes Translated: 40               ] │
-│   Warnings:                                  │
-│   • [MatName] Unsupported: NodeName          │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│ ▼ Octanify                               │
+│ ┌──────────────────────────────────────┐ │
+│ │       [ CONVERT TO OCTANE ]          │ │
+│ │ Objects to Convert                   │ │
+│ │ [ Active Object ] [ Entire Scene ]   │ │
+│ │ Selection + active object's children │ │
+│ │ Octane Material                      │ │
+│ │ [ Standard Surface (Recommended)  ▼ ]│ │
+│ │ Recommended - closest Principled match│ │
+│ │ ✓ Last conversion completed          │ │
+│ └──────────────────────────────────────┘ │
+│                                          │
+│ ┌──────────── Albedo Gamma ────────────┐ │
+│ │ [ gamma slider                      ]│ │
+│ │ [ Selected Material ] [ All Materials]│ │
+│ └──────────────────────────────────────┘ │
+│                                          │
+│ ┌────────────── Node Tools ────────────┐ │
+│ │ [ Preview Node in Viewport          ]│ │
+│ │ [Create Material] [Connect Textures] │ │
+│ │ [ Delete Cycles Nodes               ]│ │
+│ └──────────────────────────────────────┘ │
+│                                          │
+│ ▶ Displacement Settings                  │
+│ ▶ Conversion Report                      │
+└──────────────────────────────────────────┘
 ```
+
+During conversion, the completion message is replaced by a live percentage bar and the current operation. Once complete, the bar collapses back to a quiet status line so it does not compete with the main action.
 
 ## 📖 How to Use Octanify
 
-A quick breakdown of every setting in the panel so you know exactly what to click.
+### 1️⃣ Conversion Console
 
-### 1️⃣ The Big Button
-```text
-  █▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀█ 
-  █            CONVERT TO OCTANE             █ 
-  █▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄█ 
-```
-*   **What it does:** This is the magic button. It safely duplicates your Cycles materials, appends `_OCTANE` to the name, and intelligently translates the entire node tree.
+The large **Convert to Octane** action is always the first control. The conversion choices sit directly beneath it:
 
-### 2️⃣ Batch Object Conversion
-```text
-  ▼ Batch Object Conversion:                   
-    [ ◉ Active Object ]    [ ○ All Objects ]   
-```
-*   **`Active Object`**: Converts materials *only* on the currently selected object.
-*   **`All Objects`**: Scans your *entire scene* and converts every material it finds. (Grab a coffee for large scenes!)
+*   **`Active Object`** converts selected objects plus every descendant of the active object. The explanation beneath the choice always states what will be included. This supports parent/empty-based production assets whose root object has no material slots.
+*   **`Entire Scene`** scans the scene and converts every material used by its objects.
+*   **`Octane Material`** chooses what each Cycles *Principled BSDF* becomes. `Standard Surface` is recommended because its separate base, specular, transmission, coat, sheen, and subsurface controls most closely match Principled semantics. `Universal Material` remains available for compatibility and uses the plain `GGX` BRDF model—not `Octane` or `GGX (energy preserving)`.
 
-### 3️⃣ Albedo Gamma Control
-```text
-  ▼ Albedo Gamma Control:                      
-    Albedo Gamma    <────────[ 2.20 ]────────> 
-```
-*   **Why it matters:** Octane expects sRGB color textures (like Albedo/Diffuse) to have a gamma of `2.2`. Data textures (like Roughness or Normal) must remain linear (`1.0`).
-*   **What it does:** Sets the target gamma curve for color textures. *Don't worry about data textures—Octanify automatically detects linear maps and skips them!*
+Conversion preserves the authored Cycles graph, creates and auto-arranges a separate Octane graph, and gives both graphs distinct renderer outputs and editor themes.
 
-### 4️⃣ Conversion Settings
-```text
-  ▼ Conversion Settings:                       
-    Target Material [ Universal Material   ▼ ] 
-    Displacement:                              
-    [ ◉ Texture ]          [ ○ Vertex ]        
-    Level of Detail [ 2048x2048            ▼ ] 
-    Mid Level       <────────[ 0.50 ]────────> 
-```
-*   **`Target Material`**: Choose what the Cycles *Principled BSDF* turns into. Use `Universal` for maximum flexibility, or `Standard Surface` for strict industry-standard PBR workflows.
-*   **`Displacement`**: 
-    *   **Mode**: `Texture` (Standard image-based) or `Vertex` (Memory-efficient mesh displacement).
-    *   **Level of Detail (LOD)**: The resolution limit for texture displacement mapping.
-    *   **Mid Level**: The zero-point shift for your height maps.
+### 2️⃣ Live Progress
 
-### 5️⃣ Material Update Tools
-```text
-  ▼ Albedo Gamma & Update Tools:               
-    Albedo Gamma    <────────[ 2.20 ]────────> 
-    [ 🖌️ Update Selected Material            ] 
-    [ 🌍 Update All Materials                ] 
-```
-*   **What it does:** If you realize your materials look washed out *after* converting, you don't need to click Convert again. Just change the `Albedo Gamma` slider, and click one of these buttons to instantly push the new gamma value to your existing Octane textures. `Update All Materials` will update *every* converted material in your entire Blender scene!
+The progress bar appears only while conversion is running. It shows both a real-time percentage and the current material/node operation. `Esc` stops between materials while keeping completed changes undoable. After conversion, a compact success line replaces the bar.
 
-### 6️⃣ Revert to Cycles
-```text
-    [ ↺ Revert to Cycles                     ]
-```
-*   **What it does:** Accidentally converted a material or want to go back? This instantly swaps your active object (or all objects, depending on your Batch Mode) back to the original Cycles materials, keeping your workflow totally non-destructive.
+### 3️⃣ Albedo Gamma
 
-### 7️⃣ Last Conversion Report
-```text
-  ▼ Last Conversion Report:                    
-    [ ℹ️ Materials Converted: 10             ] 
-    [ 🗃️ Nodes Translated: 40               ] 
-    Warnings:                                  
-    • [MatName] Unsupported: NodeName          
-```
-*   **What it does:** Shows a summary of the most recent conversion. It tracks exactly how many materials were converted and how many nodes were translated. If any nodes were skipped or required a fallback, it lists them concisely by material and node type (e.g., `[Wood] Unsupported: RGBCurves`) so you can quickly find and fix them in the Shader Editor.
+The visible gamma control handles a common post-conversion adjustment without opening another panel. Change the slider, then choose **Selected Material** or **All Materials** to update existing Octane textures without reconverting.
+
+### 4️⃣ Node Tools
+
+Frequently used node actions stay together in a compact tool group:
+
+*   **Preview Node in Viewport** temporarily routes the selected node through an emission preview.
+*   **Create Material** creates a clean material using the selected Octane material type.
+*   **Connect Textures** connects loose PBR image nodes by filename patterns.
+*   **Delete Cycles Nodes** removes only Cycles nodes explicitly tagged by Octanify for the current `Active Object` or `Entire Scene` choice. Original Cycles nodes remain preserved by default, and cleanup asks for confirmation and supports Blender Undo.
+
+### 5️⃣ Displacement Settings
+
+Open this subpanel only when the defaults need adjustment:
+
+*   **`Mode`** selects `Texture` (standard image-based displacement) or `Vertex` (memory-efficient mesh displacement).
+*   **`Level of Detail`** controls the texture displacement resolution limit.
+*   **`Mid Level`** sets the zero point of the height map.
+
+### 6️⃣ Conversion Report
+
+Open this subpanel to inspect materials converted, nodes translated, links created, approximations, unsupported nodes, failed links, and warnings from the most recent conversion. It stays collapsed during normal use so detailed diagnostics never obscure the primary action.
 
 ## <a id="features"></a>✨ Features
 
 | Feature | Description |
 |---|---|
-| 🎯 **Principled BSDF** | Physically tuned Universal / Standard Surface mapping with safer roughness, specular, coat, sheen, transmission, and Octane-default handling |
+| 🎯 **Principled BSDF** | Fidelity-first Standard Surface mapping with direct PBR layers; physically tuned Universal compatibility mapping remains optional |
 | 🪆 **Node Groups** | Recursively converts and preserves nested Node Groups with interface caching and recursion guards |
 | 🎬 **Driver Preservation** | Automatically transfers `#frame` expressions and animation drivers |
 | 🔗 **Link Reconstruction** | Rebuilds topology with 7-strategy socket matching, shared-node preservation, reroute flattening, and duplicate socket handling |
@@ -143,8 +111,9 @@ A quick breakdown of every setting in the panel so you know exactly what to clic
 | 💡 **Emission** | Auto-inserts Octane TextureEmission nodes and perfectly scales Power (x100) |
 | 🌫️ **Volumetrics** | Maps Volume Absorption/Scatter directly to Octane Medium nodes |
 | 🗺️ **Normal & Bump** | Preserves normal chains, folds bump height into material inputs, and routes displacement according to user settings |
-| 📦 **Batch Conversion** | Convert entire scenes with one click (now with native Progress Bars!) |
-| 🔄 **Safe Revert** | Non-destructive — instantly swap back to the original Cycles setup |
+| 🧩 **UV Mapping** | Routes Texture Coordinate / UV Map to Octane Projection and Mapping to UV Transform, including radians-to-degrees rotation conversion |
+| 📦 **Batch Conversion** | Converts selected hierarchies or complete scenes with a repainting live percentage bar and operation label |
+| 🔄 **Dual Renderer Graphs** | Always keeps Cycles and Octane graphs in one material with renderer-targeted outputs, graphite/teal themes, automatic layout, and optional safe Cycles cleanup |
 | 🛡️ **Structured Fallbacks** | Unsupported or approximate conversions stay visible, produce warnings, and do not crash the conversion |
 | 🧮 **Math & Mix Wrappers** | Uses Octane Cycles-compatible wrappers where available, with native fallbacks for plugin-version differences |
 
@@ -161,8 +130,8 @@ Octane requires specific gamma curves. Albedo/Color maps need `2.2`, while data 
   └───────────────────┘ │         │ └───────────────────┘
                         ▼         │
                ┌────────┴───┐     │        ┌────────────┐
-               │ Principled │ ===>│        │ Universal  │
-               │ BSDF       │     │        │ Material   │
+               │ Principled │ ===>│        │ Standard   │
+               │ BSDF       │     │        │ Surface    │
                └────────┬───┘     │        └────────────┘
                         ▲         │
   ┌───────────────────┐ │         │ ┌───────────────────┐
@@ -205,7 +174,7 @@ Trying to figure out what a complex Math node or ColorRamp is doing? Select it a
 ```
 
 ### 🆕 `[ Create Basic Material ]`
-Instantly wipes the default Cycles Principled BSDF and gives you a fresh, properly-wired Octane `Universal` or `Standard Surface` material connected to the Material Output.
+Instantly wipes the default Cycles Principled BSDF and gives you a fresh, properly-wired Octane `Standard Surface` material (recommended) or optional `Universal` material connected to the Material Output.
 
 ---
 
@@ -227,10 +196,10 @@ Instantly wipes the default Cycles Principled BSDF and gives you a fresh, proper
 1. **Analyze** — Snapshot the Cycles node tree, normalize reroutes, preserve shared branches, and record properties, links, muted state, and output intent.
 2. **Schedule** — Cycle-safe dependency ordering creates upstream nodes first while keeping disconnected and fallback nodes visible.
 3. **Create** — Instantiate Octane equivalents using runtime-resolved `bl_idname` candidates for compatibility across Octane plugin versions.
-4. **Transfer** — Per-type handlers map Cycles values into Octane semantics, preserving Octane defaults where direct value copying would harm material fidelity.
-5. **Rebuild** — 7-strategy socket resolution reconnects links, duplicate socket identities, output indices, and one-to-many channel picker bindings.
-6. **Post-process** — Fix MixShader order, insert emission nodes, compose coat/sheen/specular helper nodes, handle alpha/opacity, Normal/Bump, displacement, and volumetrics.
-7. **Report & Gamma** — Apply albedo gamma correction, log approximate/unsupported conversions, and keep recoverable failures visible for manual review.
+4. **Transfer** — Target-aware handlers map Cycles values into the actual Octane material semantics. Standard Surface receives independent PBR layer weights and colors; Universal receives its required scaled and composed equivalents.
+5. **Rebuild** — 7-strategy socket resolution reconnects links, duplicate socket identities, output indices, one-to-many channel picker bindings, and split Projection / UV Transform paths.
+6. **Post-process** — Fix MixShader order, insert emission nodes, scale linked specular controls, compose Universal-only coat/sheen helpers, handle alpha/opacity, Normal/Bump, displacement, and volumetrics.
+7. **Style, Report & Gamma** — Apply gamma correction, create distinct Cycles/Octane graph themes, auto-arrange with a safe gap, report live progress, and keep recoverable failures visible for manual review.
 
 ---
 
@@ -245,7 +214,7 @@ The full support matrix lives in [`octanify/NODE_SUPPORT.md`](octanify/NODE_SUPP
 <details>
 <summary><strong>Shaders (23 supported / 24 tracked)</strong></summary>
 
-- Principled BSDF → Universal Material / Standard Surface
+- Principled BSDF → Standard Surface by default / Universal Material option
 - Glass BSDF → Specular Material
 - Glossy BSDF → Glossy Material
 - Diffuse BSDF → Diffuse Material
@@ -323,24 +292,43 @@ The full support matrix lives in [`octanify/NODE_SUPPORT.md`](octanify/NODE_SUPP
 ## 📁 Project Structure
 
 ```text
-octanify/
-├── __init__.py                 # Entry point, bl_info, scene properties
-├── blender_manifest.toml       # Blender 4.2+ extension manifest
-├── core/
-│   ├── node_registry.py        # 99 tracked Cycles node strategies
-│   ├── shader_detection.py     # Tree analysis, reroute flattening, transparent handling
-│   ├── graph_engine.py         # Cycle-safe dependency scheduling & node creation
-│   ├── property_mapper.py      # Per-type value transfer and fidelity-safe defaults
-│   ├── conversion_engine.py    # Main orchestrator, link rebuild, post-processing
-│   ├── gamma_system.py         # Albedo gamma correction
-│   └── volumetric_handler.py   # Volume → Octane medium handling
-├── ui/
-│   ├── panel.py                # N-Panel (3D Viewport + Shader Editor)
-│   └── operators.py            # Convert & gamma update operators
-└── utils/
-    ├── logger.py               # Console logging
-    └── cache.py                # Material dedup cache
+Octanify/
+├── README.md                            # User guide and architecture overview
+├── LICENSE                              # GPL-3.0-or-later license
+└── octanify/                            # Blender add-on package
+    ├── __init__.py                      # Registration, bl_info, and scene properties
+    ├── blender_manifest.toml            # Blender 4.2+ extension metadata
+    ├── core/                            # Conversion backend
+    │   ├── conversion_engine.py         # Transactional conversion orchestration and link rebuild
+    │   ├── shader_detection.py          # Tree analysis, outputs, reroutes, and graph boundaries
+    │   ├── graph_engine.py              # Cycle-safe dependency scheduling and node creation
+    │   ├── node_registry.py             # 99 tracked Cycles node strategies and Octane candidates
+    │   ├── property_mapper.py           # Values, enums, transforms, and fidelity-safe defaults
+    │   ├── layout_engine.py             # Dual-graph spacing, themes, and automatic arrangement
+    │   ├── gamma_system.py              # Albedo/data texture gamma classification and updates
+    │   ├── volumetric_handler.py        # Cycles volume to Octane medium routing
+    │   └── report.py                    # Structured statistics, warnings, and approximations
+    ├── ui/                              # Blender interface layer
+    │   ├── panel.py                     # Viewport and Shader Editor control-deck panels
+    │   └── operators.py                 # Batch conversion, progress, cleanup, and material tools
+    ├── utils/                           # Shared infrastructure
+    │   ├── cache.py                     # Conversion and material deduplication cache
+    │   └── logger.py                    # Structured console logging
+    ├── NODE_SUPPORT.md                  # Cycles node support and fallback matrix
+    ├── MATERIAL_FIDELITY.md             # Principled/Octane mapping and validation notes
+    ├── tests/                           # Repository-only automated regression tests
+    │   ├── test_graph_and_registry.py   # Graph, mapping, lifecycle, and regression coverage
+    │   └── test_panel_ui.py             # UI hierarchy and visibility regression coverage
+    └── tools/                           # Repository-only Blender/Octane validation utilities
+        ├── blender_fixture_scene.py     # Builds production-style validation materials
+        ├── blender_validate_conversion.py # Runs integration and fidelity assertions
+        ├── blender_validation_bootstrap.py # Loads the workspace add-on and Octane plugin
+        ├── blender_probe_universal_material.py # Compares Universal Material initialization
+        ├── blender_probe_bootstrap.py   # Bootstraps Octane material probes
+        └── blender_inspect_octane_nodes.py # Inspects installed Octane node definitions
 ```
+
+The clean release archive contains the license and runtime add-on files: `LICENSE`, `__init__.py`, `blender_manifest.toml`, `core/`, `ui/`, and `utils/`. Documentation, tests, validation tools, caches, and development metadata remain repository-only.
 
 ---
 

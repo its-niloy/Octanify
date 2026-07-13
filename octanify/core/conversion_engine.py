@@ -3,7 +3,7 @@
 This is the main pipeline that coordinates the full conversion of a
 single Cycles material into an Octane material:
 
-1. Duplicate material
+1. Preserve the Cycles graph in-place (smart mode) or duplicate the material
 2. Analyze the original tree
 3. Clear the new tree (keeping output node)
 4. Build conversion schedule via the graph engine
@@ -16,7 +16,7 @@ single Cycles material into an Octane material:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Iterable
 
 import bpy
 
@@ -30,8 +30,10 @@ from .node_registry import (
     SKIP_TYPES,
     create_octane_node,
     create_node_from_candidates,
+    is_standard_surface_node,
 )
 from .gamma_system import apply_gamma
+from .layout_engine import style_converted_graph, style_smart_graphs
 from .volumetric_handler import handle_volumetrics
 from .report import report_data
 from ..utils.logger import get_logger
@@ -50,6 +52,14 @@ log = get_logger()
 _cache = ConversionCache()
 
 
+def _rna_identity(value) -> int:
+    """Return a stable identity for Blender RNA wrappers and test doubles."""
+    try:
+        return int(value.as_pointer())
+    except (AttributeError, ReferenceError, TypeError):
+        return id(value)
+
+
 def get_cache() -> ConversionCache:
     return _cache
 
@@ -62,13 +72,9 @@ def reset_cache() -> None:
 # Tree clearing
 # ---------------------------------------------------------------------------
 
-def _clear_tree_except_output(node_tree: bpy.types.NodeTree) -> None:
-    """Remove all nodes except ShaderNodeOutputMaterial."""
-    to_remove = [
-        n for n in node_tree.nodes
-        if n.bl_idname != "ShaderNodeOutputMaterial"
-    ]
-    for n in to_remove:
+def _clear_tree(node_tree: bpy.types.NodeTree) -> None:
+    """Remove every copied node before constructing an Octane-only tree."""
+    for n in list(node_tree.nodes):
         node_tree.nodes.remove(n)
 
 
@@ -100,6 +106,128 @@ def _maybe_report_socket_mismatch(
 # Link reconstruction
 # ---------------------------------------------------------------------------
 
+_COORDINATE_NODE_TYPES = {"ShaderNodeTexCoord", "ShaderNodeUVMap"}
+
+
+def _first_named_socket(collection, *names: str):
+    for name in names:
+        socket = collection.get(name)
+        if socket is not None:
+            return socket
+    return None
+
+
+def _contextual_vector_input(
+    from_type: str,
+    to_socket_name: str,
+    octane_node: bpy.types.Node,
+):
+    """Resolve Cycles Vector edges using Octane pin semantics.
+
+    Octane does not pass UV coordinates through a transformation node. A
+    Mapping node emits a transform and a Texture Coordinate/UV Map node emits
+    a projection; both connect independently to the destination texture.
+    """
+    if to_socket_name != "Vector":
+        return None
+    if from_type == "ShaderNodeMapping":
+        return _first_named_socket(
+            octane_node.inputs,
+            "UV transform",
+            "Transform",
+            "UVTransform",
+        )
+    if from_type in _COORDINATE_NODE_TYPES:
+        return _first_named_socket(octane_node.inputs, "Projection", "UV")
+    return None
+
+
+def _mapping_consumers(
+    analysis: TreeAnalysis,
+    mapping_name: str,
+):
+    """Yield non-Mapping consumers reached from a Mapping output."""
+    queue = [mapping_name]
+    visited: set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        for edge in analysis.links:
+            if edge.from_node != current or edge.from_socket != "Vector":
+                continue
+            target_info = analysis.nodes.get(edge.to_node)
+            if target_info is None:
+                continue
+            if target_info.bl_idname == "ShaderNodeMapping":
+                queue.append(edge.to_node)
+            else:
+                yield edge
+
+
+def _link_projection_through_mapping(
+    coordinate_link,
+    analysis: TreeAnalysis,
+    node_map: dict[str, bpy.types.Node],
+    target_tree: bpy.types.NodeTree,
+    graph_engine: GraphEngine | None,
+) -> None:
+    """Route a coordinate projection around Mapping to texture consumers."""
+    source_info = analysis.nodes.get(coordinate_link.from_node)
+    octane_source = node_map.get(coordinate_link.from_node)
+    if source_info is None or octane_source is None:
+        return
+    projection_output = resolve_output_socket(
+        source_info.bl_idname,
+        coordinate_link.from_socket,
+        octane_source,
+        socket_identifier=getattr(coordinate_link, "from_socket_identifier", ""),
+    )
+    if projection_output is None:
+        report_data.add_link_failure(
+            f"Cannot resolve projection output {coordinate_link.from_node}."
+            f"{coordinate_link.from_socket}"
+        )
+        return
+
+    connected = False
+    for consumer in _mapping_consumers(analysis, coordinate_link.to_node):
+        octane_targets = (
+            graph_engine.created_nodes_for(consumer.to_node, node_map)
+            if graph_engine is not None
+            else ([node_map[consumer.to_node]] if consumer.to_node in node_map else [])
+        )
+        for octane_target in octane_targets:
+            projection_input = _first_named_socket(
+                octane_target.inputs,
+                "Projection",
+                "UV",
+            )
+            if projection_input is None:
+                report_data.add_approximation(
+                    f"[{target_tree.name}] {consumer.to_node} has no Projection "
+                    "input for the original coordinate chain"
+                )
+                continue
+            try:
+                for existing in list(projection_input.links):
+                    target_tree.links.remove(existing)
+                target_tree.links.new(projection_output, projection_input)
+                report_data.links_created += 1
+                connected = True
+            except Exception as exc:
+                report_data.add_link_failure(
+                    f"Failed projection link {coordinate_link.from_node}."
+                    f"{coordinate_link.from_socket} -> {consumer.to_node}.Projection: {exc}"
+                )
+
+    if not connected:
+        report_data.add_approximation(
+            f"[{target_tree.name}] Coordinate input for Mapping "
+            f"'{coordinate_link.to_node}' could not be attached to a downstream Projection"
+        )
+
 def _rebuild_links(
     analysis: TreeAnalysis,
     node_map: dict[str, bpy.types.Node],
@@ -128,6 +256,16 @@ def _rebuild_links(
             else ([node_map[to_name]] if to_name in node_map else [])
         )
 
+        # Inactive duplicate Material Outputs are intentionally not rebuilt.
+        # Their shader branches remain available as disconnected converted
+        # nodes, while the active authored output determines the render path.
+        if (
+            not oct_targets
+            and graph_engine is not None
+            and graph_engine.is_skipped_material_output(to_name)
+        ):
+            continue
+
         if oct_from is None or not oct_targets:
             report_data.add_link_failure(
                 f"Skipped link {from_name}.{from_sock_name} -> "
@@ -147,6 +285,48 @@ def _rebuild_links(
 
         from_type = from_info.bl_idname
         to_type = to_info.bl_idname
+        standard_surface_target = (
+            to_type == "ShaderNodeBsdfPrincipled"
+            and all(is_standard_surface_node(node) for node in oct_targets)
+        )
+
+        # Cycles feeds coordinates into Mapping, but Octane's 3D
+        # Transformation has no coordinate input (its first pin is Rotation
+        # order). Route the projection around Mapping to every downstream
+        # texture instead of creating a type-invalid link.
+        if to_type == "ShaderNodeMapping" and to_sock_name == "Vector":
+            if from_type in _COORDINATE_NODE_TYPES:
+                _link_projection_through_mapping(
+                    link_info,
+                    analysis,
+                    node_map,
+                    target_tree,
+                    graph_engine,
+                )
+            else:
+                report_data.add_approximation(
+                    f"[{target_tree.name}] {from_name}.{from_sock_name} drives "
+                    f"Mapping '{to_name}', but an Octane Transform cannot accept "
+                    "a vector input"
+                )
+            continue
+
+        if from_type == "ShaderNodeMapping" and to_type == "ShaderNodeMapping":
+            report_data.add_approximation(
+                f"[{target_tree.name}] Chained Mapping nodes '{from_name}' and "
+                f"'{to_name}' require transform composition; the downstream "
+                "transform is preserved"
+            )
+            continue
+
+        # Octane's native material output has only a Material input.  Volume
+        # and displacement are properties of the connected material and are
+        # rebuilt by their topology-aware post-processing passes below.
+        if (
+            to_type == "ShaderNodeOutputMaterial"
+            and to_sock_name in {"Volume", "Displacement"}
+        ):
+            continue
 
         # Normal Map/Bump placeholder nodes have no compatible inputs.  Their
         # complete incoming/outgoing topology is reconstructed by the
@@ -168,6 +348,7 @@ def _rebuild_links(
             to_type in ("ShaderNodeBsdfPrincipled", "ShaderNodeEmission")
             and to_sock_name in (
                 "Emission Color",
+                "Emission",
                 "Emission Strength",
                 "Color",
                 "Strength",
@@ -178,26 +359,48 @@ def _rebuild_links(
             continue
 
         if to_type == "ShaderNodeBsdfPrincipled":
-            if to_sock_name in {
+            if standard_surface_target:
+                if to_sock_name in {"Specular IOR Level", "Specular"}:
+                    # Both targets need the Cycles 0.5 -> Octane 1.0 scale.
+                    continue
+                unsupported_standard_inputs = {"Tangent", "Subsurface IOR"}
+                if to_sock_name not in unsupported_standard_inputs:
+                    # Standard Surface has semantically matching sockets for
+                    # the remaining Principled layers, so generic link
+                    # reconstruction is correct.
+                    pass
+                else:
+                    report_data.add_approximation(
+                        f"[{target_tree.name}] Principled {to_sock_name} has no "
+                        "direct Standard Surface control"
+                    )
+                    continue
+            elif to_sock_name in {
                 "Specular IOR Level",
+                "Specular",
                 "Coat Weight",
+                "Clearcoat",
                 "Coat Tint",
                 "Sheen Weight",
+                "Sheen",
                 "Sheen Tint",
             }:
-                # These require scaling or weight × tint graph composition.
-                # Linking either Cycles socket directly changes the physical
-                # meaning of the Octane material.
+                # Universal encodes coat/sheen as coloured contribution, so
+                # weights and tints must be composed by the dedicated pass.
                 continue
-            if to_sock_name in {
+            elif to_sock_name in {
+                "Base Weight",
                 "Diffuse Roughness",
                 "Specular Tint",
                 "Tangent",
                 "Subsurface Weight",
+                "Subsurface",
+                "Subsurface Color",
                 "Subsurface Radius",
                 "Subsurface Scale",
                 "Subsurface IOR",
                 "Subsurface Anisotropy",
+                "Transmission Roughness",
             }:
                 report_data.add_approximation(
                     f"[{target_tree.name}] Principled {to_sock_name} has no "
@@ -230,6 +433,12 @@ def _rebuild_links(
                 in_socket = (
                     oct_to.inputs.get("Round edges")
                     or oct_to.inputs.get("Round Edges")
+                )
+            if in_socket is None:
+                in_socket = _contextual_vector_input(
+                    from_type,
+                    to_sock_name,
+                    oct_to,
                 )
             if in_socket is None:
                 in_socket = resolve_input_socket(
@@ -285,6 +494,18 @@ def _incoming_link(
         ),
         None,
     )
+
+
+def _incoming_link_any(
+    analysis: TreeAnalysis,
+    node_name: str,
+    socket_names: tuple[str, ...],
+):
+    for socket_name in socket_names:
+        link = _incoming_link(analysis, node_name, socket_name)
+        if link is not None:
+            return link
+    return None
 
 
 def _source_socket_for_link(
@@ -388,14 +609,14 @@ def _materialize_weighted_layer(
     info,
     material_node,
     *,
-    weight_name: str,
-    tint_name: str,
+    weight_names: tuple[str, ...],
+    tint_names: tuple[str, ...],
     target_names: tuple[str, ...],
     label: str,
 ) -> None:
     """Build tint × weight only when either Cycles input is connected."""
-    weight_link = _incoming_link(analysis, node_name, weight_name)
-    tint_link = _incoming_link(analysis, node_name, tint_name)
+    weight_link = _incoming_link_any(analysis, node_name, weight_names)
+    tint_link = _incoming_link_any(analysis, node_name, tint_names)
     if weight_link is None and tint_link is None:
         return
 
@@ -421,8 +642,22 @@ def _materialize_weighted_layer(
         weight_link, analysis, node_map, graph_engine
     )
 
-    tint = _get_node_input_value(info, tint_name, (1.0, 1.0, 1.0, 1.0))
-    weight = _get_node_input_value(info, weight_name, 0.0)
+    tint = next(
+        (
+            value
+            for name in tint_names
+            if (value := _get_node_input_value(info, name)) is not None
+        ),
+        (1.0, 1.0, 1.0, 1.0),
+    )
+    weight = next(
+        (
+            value
+            for name in weight_names
+            if (value := _get_node_input_value(info, name)) is not None
+        ),
+        0.0,
+    )
     if tint_link is not None and tint_source is None:
         report_data.add_warning(
             f"[{tree.name}] Cannot resolve linked Principled {label} tint"
@@ -475,7 +710,7 @@ def _handle_principled_material_inputs(
     tree: bpy.types.NodeTree,
     graph_engine: GraphEngine | None = None,
 ) -> None:
-    """Finish Universal inputs that cannot be represented by direct copies."""
+    """Finish Principled inputs that require target-aware graph operations."""
     for node_name, info in analysis.nodes.items():
         if info.bl_idname != "ShaderNodeBsdfPrincipled":
             continue
@@ -485,36 +720,47 @@ def _handle_principled_material_inputs(
             else ([node_map[node_name]] if node_name in node_map else [])
         )
         for material_node in material_nodes:
-            _materialize_weighted_layer(
-                analysis, node_map, tree, graph_engine, node_name, info,
-                material_node,
-                weight_name="Coat Weight",
-                tint_name="Coat Tint",
-                target_names=("Coating", "Coating color"),
-                label="coat",
-            )
-            _materialize_weighted_layer(
-                analysis, node_map, tree, graph_engine, node_name, info,
-                material_node,
-                weight_name="Sheen Weight",
-                tint_name="Sheen Tint",
-                target_names=("Sheen", "Sheen color"),
-                label="sheen",
-            )
+            standard_surface = is_standard_surface_node(material_node)
+            if not standard_surface:
+                _materialize_weighted_layer(
+                    analysis, node_map, tree, graph_engine, node_name, info,
+                    material_node,
+                    weight_names=("Coat Weight", "Clearcoat"),
+                    tint_names=("Coat Tint",),
+                    target_names=("Coating", "Coating color"),
+                    label="coat",
+                )
+                _materialize_weighted_layer(
+                    analysis, node_map, tree, graph_engine, node_name, info,
+                    material_node,
+                    weight_names=("Sheen Weight", "Sheen"),
+                    tint_names=("Sheen Tint",),
+                    target_names=("Sheen", "Sheen color"),
+                    label="sheen",
+                )
 
-            specular_link = _incoming_link(
-                analysis, node_name, "Specular IOR Level"
+            specular_link = _incoming_link_any(
+                analysis, node_name, ("Specular IOR Level", "Specular")
             )
             if specular_link is not None:
                 source = _source_socket_for_link(
                     specular_link, analysis, node_map, graph_engine
+                )
+                target = _first_socket(
+                    material_node.inputs,
+                    (
+                        ("Specular weight",)
+                        if standard_surface
+                        else ("Specular", "Specular float")
+                    ),
                 )
                 multiply = create_node_from_candidates(
                     tree,
                     ("OctaneMultiplyTexture", "ShaderNodeOctMultiplyTex"),
                     label="Principled specular × 2",
                 )
-                if multiply is not None:
+                scaled = False
+                if multiply is not None and source is not None and target is not None:
                     texture1 = _first_socket(
                         multiply.inputs, ("Texture 1", "Texture1")
                     )
@@ -522,17 +768,29 @@ def _handle_principled_material_inputs(
                         multiply.inputs, ("Texture 2", "Texture2")
                     )
                     _set_socket_default(texture2, 2.0)
-                    _link_generated(tree, source, texture1, "Principled specular")
-                    _link_generated(
+                    scaled = _link_generated(
+                        tree, source, texture1, "Principled specular"
+                    ) and _link_generated(
                         tree,
                         _first_socket(
                             multiply.outputs,
                             ("Texture out", "OutTex", "Output"),
                         ),
-                        _first_socket(
-                            material_node.inputs, ("Specular", "Specular float")
-                        ),
+                        target,
                         "scaled Principled specular",
+                    )
+                if not scaled:
+                    if multiply is not None:
+                        try:
+                            tree.nodes.remove(multiply)
+                        except (AttributeError, RuntimeError, TypeError, ValueError):
+                            pass
+                    report_data.add_approximation(
+                        f"[{tree.name}] Linked Principled specular could not be "
+                        "scaled by 2; preserving the source connection"
+                    )
+                    _link_generated(
+                        tree, source, target, "unscaled Principled specular"
                     )
 
             transmission_link = _incoming_link(
@@ -542,6 +800,54 @@ def _handle_principled_material_inputs(
                 info, "Transmission Weight",
                 _get_node_input_value(info, "Transmission", 0.0),
             )
+            if standard_surface:
+                # Cycles shares Base Color with transmission and SSS.  When
+                # Base Color is textured, fan that texture out to the active
+                # Standard Surface layer colours as well.
+                base_link = _incoming_link(analysis, node_name, "Base Color")
+                base_source = _source_socket_for_link(
+                    base_link, analysis, node_map, graph_engine
+                )
+                layer_colors = (
+                    (
+                        transmission_link is not None
+                        or (isinstance(transmission, (int, float)) and transmission > 0.0),
+                        "Transmission color",
+                    ),
+                    (
+                        _incoming_link_any(
+                            analysis,
+                            node_name,
+                            ("Subsurface Weight", "Subsurface"),
+                        ) is not None
+                        or (
+                            isinstance(
+                                _get_node_input_value(
+                                    info,
+                                    "Subsurface Weight",
+                                    _get_node_input_value(info, "Subsurface", 0.0),
+                                ),
+                                (int, float),
+                            )
+                            and _get_node_input_value(
+                                info,
+                                "Subsurface Weight",
+                                _get_node_input_value(info, "Subsurface", 0.0),
+                            ) > 0.0
+                        ),
+                        "Subsurface color",
+                    ),
+                )
+                for active, socket_name in layer_colors:
+                    if active and base_source is not None:
+                        _link_generated(
+                            tree,
+                            base_source,
+                            _first_socket(material_node.inputs, (socket_name,)),
+                            f"Principled {socket_name}",
+                        )
+                continue
+
             target = _first_socket(
                 material_node.inputs, ("Transmission", "Transmission float")
             )
@@ -597,11 +903,11 @@ def _fix_mix_shader_links(
         # Find material input sockets on the Octane MixMaterial
         mat1_sock = None
         mat2_sock = None
-        for name in ["Material1", "Shader1", "Material 1"]:
+        for name in ["First material", "Material1", "Shader1", "Material 1"]:
             mat1_sock = oct_node.inputs.get(name)
             if mat1_sock is not None:
                 break
-        for name in ["Material2", "Shader2", "Material 2"]:
+        for name in ["Second material", "Material2", "Shader2", "Material 2"]:
             mat2_sock = oct_node.inputs.get(name)
             if mat2_sock is not None:
                 break
@@ -785,37 +1091,52 @@ def _handle_alpha(
 # ---------------------------------------------------------------------------
 
 def _handle_output_displacement(
+    analysis: TreeAnalysis,
+    node_map: dict[str, bpy.types.Node],
     target_tree: bpy.types.NodeTree,
+    graph_engine: GraphEngine | None = None,
 ) -> None:
-    """Move output displacement links onto the Octane material when possible."""
-    for output_node in target_tree.nodes:
-        if output_node.bl_idname != "ShaderNodeOutputMaterial":
+    """Attach each output displacement branch to its Octane material."""
+    for output_name, output_info in analysis.nodes.items():
+        if output_info.bl_idname != "ShaderNodeOutputMaterial":
             continue
 
-        surface_input = output_node.inputs.get("Surface")
-        displacement_input = output_node.inputs.get("Displacement")
-        if surface_input is None or displacement_input is None:
-            continue
-        if not surface_input.links or not displacement_input.links:
-            continue
-
-        material_node = surface_input.links[0].from_node
-        material_displacement = material_node.inputs.get("Displacement")
-        if material_displacement is None:
+        displacement_link = _incoming_link(
+            analysis, output_name, "Displacement"
+        )
+        surface_link = _incoming_link(analysis, output_name, "Surface")
+        if displacement_link is None or surface_link is None:
             continue
 
-        displacement_link = displacement_input.links[0]
-        displacement_output = displacement_link.from_socket
-
-        try:
-            target_tree.links.remove(displacement_link)
-            target_tree.links.new(displacement_output, material_displacement)
-            log.info(
-                "Moved output displacement to '%s'.Displacement",
-                material_node.name,
+        material_node = (
+            graph_engine.source_node_for(surface_link, node_map)
+            if graph_engine is not None
+            else node_map.get(surface_link.from_node)
+        )
+        material_displacement = (
+            material_node.inputs.get("Displacement")
+            if material_node is not None
+            else None
+        )
+        displacement_output = _source_socket_for_link(
+            displacement_link,
+            analysis,
+            node_map,
+            graph_engine,
+        )
+        if material_displacement is None or displacement_output is None:
+            report_data.add_warning(
+                f"[{target_tree.name}] Could not attach displacement for "
+                f"'{output_name}' to its converted material"
             )
-        except Exception as exc:
-            log.warning("Failed to reroute displacement: %s", exc)
+            continue
+
+        _link_generated(
+            target_tree,
+            displacement_output,
+            material_displacement,
+            f"{output_name} displacement",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +1147,10 @@ def _validate_converted_tree(material_name: str, target_tree: bpy.types.NodeTree
     """Report obvious conversion leftovers that need manual review."""
     output_nodes = [
         node for node in target_tree.nodes
-        if node.bl_idname == "ShaderNodeOutputMaterial"
+        if node.bl_idname in (
+            "OctaneMaterialOutputNode",
+            "ShaderNodeOutputMaterial",
+        )
     ]
     if not output_nodes:
         # Shader node groups terminate at Group Output rather than Material
@@ -840,7 +1164,9 @@ def _validate_converted_tree(material_name: str, target_tree: bpy.types.NodeTree
         return
 
     for output_node in output_nodes:
-        surface = output_node.inputs.get("Surface")
+        surface = output_node.inputs.get("Material")
+        if surface is None:
+            surface = output_node.inputs.get("Surface")
         if surface is not None and not surface.links:
             report_data.add_warning(
                 f"[{material_name}] Material output has no surface connection"
@@ -970,7 +1296,7 @@ def _handle_emission_node_insertion(
             continue
 
         color_names = (
-            ("Emission Color",)
+            ("Emission Color", "Emission")
             if info.bl_idname == "ShaderNodeBsdfPrincipled"
             else ("Color",)
         )
@@ -1513,7 +1839,7 @@ def convert_node_group(
 
     tree_name = group_tree.name
     cache_key = f"GRP_{tree_name}"
-    
+
     if _cache.has_material(cache_key):
         cached_name = _cache.get_converted_material_name(cache_key)
         cached_tree = bpy.data.node_groups.get(cached_name)
@@ -1599,7 +1925,7 @@ def convert_node_group(
             analysis, node_map, new_tree, engine
         )
         _handle_normal_map_fallback(analysis, node_map, new_tree, engine)
-        _handle_output_displacement(new_tree)
+        _handle_output_displacement(analysis, node_map, new_tree, engine)
         _fix_mix_shader_links(analysis, node_map, new_tree)
         _handle_alpha(analysis, node_map, new_tree)
         _handle_emission_node_insertion(analysis, node_map, new_tree, engine)
@@ -1638,24 +1964,26 @@ def _preserve_drivers(
     anim_data = getattr(orig_tree, "animation_data", None)
     if not anim_data or not getattr(anim_data, "drivers", None):
         return
-        
+
     import re
-    
-    for driver in anim_data.drivers:
+
+    # Smart conversion can add drivers to the same node tree. Snapshot the
+    # collection so appending converted drivers cannot extend this iteration.
+    for driver in list(anim_data.drivers):
         dp = driver.data_path
         match = re.search(r'nodes\["([^"]+)"\]\.(inputs|outputs)\[(\d+|"[^"]+")\]\.default_value', dp)
         if not match:
             continue
-            
+
         node_name, io_type, idx_str = match.groups()
         oct_node = node_map.get(node_name)
         orig_info = analysis.nodes.get(node_name)
         if not oct_node or not orig_info:
             continue
-            
+
         orig_socket_name = ""
         is_output_driven = (io_type == "outputs")
-        
+
         if idx_str.startswith('"'):
             orig_socket_name = idx_str.strip('"')
         else:
@@ -1668,7 +1996,7 @@ def _preserve_drivers(
                         orig_socket_name = collection[idx].name
             except ValueError:
                 pass
-                
+
         oct_idx = -1
         if is_output_driven and orig_info.bl_idname == "ShaderNodeValue":
             # Value nodes are driven on their output in Cycles, but Octane expects input 0 to be driven.
@@ -1680,19 +2008,19 @@ def _preserve_drivers(
                     if s == oct_socket:
                         oct_idx = i
                         break
-                        
+
         if oct_idx == -1:
             continue
-            
+
         new_dp = f'nodes["{oct_node.name}"].inputs[{oct_idx}].default_value'
-        
+
         try:
             if not target_tree.animation_data:
                 target_tree.animation_data_create()
             d = target_tree.driver_add(new_dp, driver.array_index)
             d.driver.type = driver.driver.type
             d.driver.expression = driver.driver.expression
-            
+
             for var in driver.driver.variables:
                 new_var = d.driver.variables.new()
                 new_var.name = var.name
@@ -1730,24 +2058,127 @@ def _is_octane_material(mat: bpy.types.Material) -> bool:
     )
 
 
+def _capture_node_visual_state(nodes: Iterable[bpy.types.Node]) -> list[tuple]:
+    """Snapshot editor-only state so smart conversion can roll back fully."""
+    state = []
+    for node in nodes:
+        graph_tag = None
+        had_graph_tag = False
+        try:
+            had_graph_tag = "octanify_graph" in node
+            if had_graph_tag:
+                graph_tag = node["octanify_graph"]
+        except (AttributeError, KeyError, TypeError):
+            pass
+        state.append((
+            node,
+            (float(node.location.x), float(node.location.y)),
+            bool(getattr(node, "use_custom_color", False)),
+            tuple(getattr(node, "color", (0.0, 0.0, 0.0))),
+            had_graph_tag,
+            graph_tag,
+            getattr(node, "target", None),
+            getattr(node, "is_active_output", None),
+        ))
+    return state
+
+
+def _restore_node_visual_state(state: list[tuple]) -> None:
+    for (
+        node,
+        location,
+        use_custom_color,
+        color,
+        had_tag,
+        graph_tag,
+        target,
+        _is_active_output,
+    ) in state:
+        try:
+            node.location = location
+            node.use_custom_color = use_custom_color
+            node.color = color
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        try:
+            if had_tag:
+                node["octanify_graph"] = graph_tag
+            elif "octanify_graph" in node:
+                del node["octanify_graph"]
+        except (AttributeError, KeyError, TypeError):
+            pass
+        if target is not None:
+            try:
+                node.target = target
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+    _restore_active_output_state(state)
+
+
+def _restore_active_output_state(state: list[tuple]) -> None:
+    """Restore authored output selection after creating an Octane output."""
+    # Activate the original winner last. Blender enforces one active Material
+    # Output globally, so assignment order matters when several outputs exist.
+    for expected in (False, True):
+        for item in state:
+            node = item[0]
+            is_active_output = item[-1]
+            if is_active_output is None or bool(is_active_output) != expected:
+                continue
+            try:
+                node.is_active_output = expected
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                pass
+
+
+def _route_original_outputs_to_cycles(
+    nodes: Iterable[bpy.types.Node],
+) -> None:
+    """Reserve generic Blender outputs for Cycles before adding Octane's ALL output."""
+    for node in nodes:
+        if getattr(node, "bl_idname", "") != "ShaderNodeOutputMaterial":
+            continue
+        try:
+            if node.target in ("", "ALL"):
+                node.target = "CYCLES"
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+
 def _populate_converted_material(
     original: bpy.types.Material,
     converted: bpy.types.Material,
     analysis: TreeAnalysis,
     gamma_value: float,
     obj: bpy.types.Object | None,
-) -> None:
-    """Populate a duplicated material; the caller owns transaction cleanup."""
-    _clear_tree_except_output(converted.node_tree)
+    clear_existing: bool = True,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> list[bpy.types.Node]:
+    """Build an Octane graph and return every node owned by that graph."""
+    if clear_existing:
+        _clear_tree(converted.node_tree)
+    baseline_ids = {_rna_identity(node) for node in converted.node_tree.nodes}
 
     engine = GraphEngine(
         analysis,
         group_converter_cb=lambda tree: convert_node_group(tree, gamma_value),
         context_name=converted.name,
+        reuse_output_nodes=clear_existing,
     )
-    node_map = engine.create_nodes(converted.node_tree)
 
-    for node_name in node_map:
+    def _node_progress(completed: int, total: int, label: str) -> None:
+        if progress_callback is None:
+            return
+        fraction = 1.0 if total == 0 else completed / total
+        progress_callback(0.05 + (0.55 * fraction), f"Creating {label}")
+
+    node_map = engine.create_nodes(
+        converted.node_tree,
+        progress_callback=_node_progress if progress_callback is not None else None,
+    )
+
+    property_total = max(1, len(node_map))
+    for property_index, node_name in enumerate(node_map, start=1):
         info = analysis.nodes.get(node_name)
         if info is not None:
             for octane_node in engine.created_nodes_for(node_name, node_map):
@@ -1759,7 +2190,14 @@ def _populate_converted_material(
                         f"'{node_name}': {exc}"
                     )
                     log.warning("Property transfer failed for '%s': %s", node_name, exc)
+        if progress_callback is not None:
+            progress_callback(
+                0.60 + (0.18 * property_index / property_total),
+                f"Transferring {node_name}",
+            )
 
+    if progress_callback is not None:
+        progress_callback(0.80, "Rebuilding node links")
     _rebuild_links(analysis, node_map, converted.node_tree, engine)
     _handle_principled_material_inputs(
         analysis, node_map, converted.node_tree, engine
@@ -1767,26 +2205,53 @@ def _populate_converted_material(
     _handle_normal_map_fallback(
         analysis, node_map, converted.node_tree, engine
     )
-    _handle_output_displacement(converted.node_tree)
+    _handle_output_displacement(
+        analysis, node_map, converted.node_tree, engine
+    )
     _fix_mix_shader_links(analysis, node_map, converted.node_tree)
     _handle_alpha(analysis, node_map, converted.node_tree)
     _handle_emission_post(analysis, node_map, converted.node_tree)
     _handle_emission_node_insertion(
         analysis, node_map, converted.node_tree, engine
     )
+    if progress_callback is not None:
+        progress_callback(0.90, "Finalizing material graph")
     handle_volumetrics(analysis, node_map, converted.node_tree)
     apply_gamma(converted, gamma_value)
     _apply_scale_correction(obj, node_map, analysis)
     _preserve_drivers(original.node_tree, analysis, node_map, converted.node_tree)
     _validate_converted_tree(converted.name, converted.node_tree)
 
+    graph_nodes: list[bpy.types.Node] = []
+    seen: set[int] = set()
+    for node in converted.node_tree.nodes:
+        identity = _rna_identity(node)
+        if identity not in baseline_ids:
+            graph_nodes.append(node)
+            seen.add(identity)
+    # Include every mapped node even if a compatibility path reused one that
+    # existed at the baseline.
+    for mapped in node_map.values():
+        identity = _rna_identity(mapped)
+        if identity not in seen:
+            graph_nodes.append(mapped)
+            seen.add(identity)
+    return graph_nodes
+
 def convert_material(
     mat: bpy.types.Material,
     gamma_value: float = 2.2,
     obj: bpy.types.Object | None = None,
+    smart_conversion: bool = True,
+    auto_arrange: bool = True,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> bpy.types.Material | None:
     """
     Convert a single Cycles material to Octane.
+
+    Smart conversion appends an Octane-compatible ALL output graph to the original
+    material so Cycles and Octane can coexist. Legacy mode creates a separate
+    material datablock and assigns it through the calling object slot.
 
     Returns the new Octane material, or None on failure.
     """
@@ -1795,13 +2260,13 @@ def convert_material(
         return None
 
     mat_name = mat.name
-    
+
     # Prevent converting an already converted or natively-authored Octane
     # material.  Name suffixes alone are not reliable because Blender appends
     # .001 and users may legitimately use `_OCTANE` in a Cycles material name.
     if _is_octane_material(mat):
         log.info("Material '%s' is already an Octane material, skipping", mat_name)
-        return mat
+        return None
 
     # Check cache
     if _cache.has_material(mat_name):
@@ -1815,23 +2280,83 @@ def convert_material(
     log.info("Converting material: %s", mat_name)
 
     new_mat = None
+    original_nodes = list(mat.node_tree.nodes)
+    original_node_ids = {_rna_identity(node) for node in original_nodes}
+    original_visual_state = _capture_node_visual_state(original_nodes)
     try:
+        if progress_callback is not None:
+            progress_callback(0.02, f"Analyzing {mat_name}")
         analysis = analyze_tree(mat.node_tree)
-        new_mat = mat.copy()
-        new_mat.name = f"{mat_name}_OCTANE"
-        new_mat.use_nodes = True
+        if smart_conversion:
+            new_mat = mat
+            _route_original_outputs_to_cycles(original_nodes)
+            converted_nodes = _populate_converted_material(
+                mat,
+                mat,
+                analysis,
+                gamma_value,
+                obj,
+                clear_existing=False,
+                progress_callback=progress_callback,
+            )
+            style_smart_graphs(
+                mat.node_tree,
+                original_nodes,
+                converted_nodes,
+                auto_arrange=auto_arrange,
+            )
+            _restore_active_output_state(original_visual_state)
+        else:
+            new_mat = mat.copy()
+            new_mat.name = f"{mat_name}_OCTANE"
+            new_mat.use_nodes = True
+            converted_nodes = _populate_converted_material(
+                mat,
+                new_mat,
+                analysis,
+                gamma_value,
+                obj,
+                clear_existing=True,
+                progress_callback=progress_callback,
+            )
+            style_converted_graph(
+                new_mat.node_tree,
+                converted_nodes,
+                auto_arrange=auto_arrange,
+            )
+
         try:
             new_mat["octanify_source_material"] = mat_name
             new_mat["octanify_converted"] = True
+            new_mat["octanify_smart_conversion"] = smart_conversion
         except (AttributeError, TypeError):
             pass
-
-        _populate_converted_material(mat, new_mat, analysis, gamma_value, obj)
+        if progress_callback is not None:
+            progress_callback(1.0, f"Completed {mat_name}")
     except Exception as exc:
         message = f"[{mat_name}] Conversion failed and was rolled back: {exc}"
         report_data.add_warning(message)
         log.error(message, exc_info=True)
-        if new_mat is not None:
+        if progress_callback is not None:
+            progress_callback(1.0, f"Failed {mat_name}")
+        if smart_conversion:
+            # In-place conversion is transactional: remove only nodes created
+            # during this attempt and leave the authored Cycles tree intact.
+            for node in list(mat.node_tree.nodes):
+                if _rna_identity(node) not in original_node_ids:
+                    try:
+                        mat.node_tree.nodes.remove(node)
+                    except (AttributeError, RuntimeError, TypeError):
+                        pass
+            _restore_node_visual_state(original_visual_state)
+            try:
+                if "octanify_converted" in mat:
+                    del mat["octanify_converted"]
+                if "octanify_smart_conversion" in mat:
+                    del mat["octanify_smart_conversion"]
+            except (AttributeError, KeyError, TypeError):
+                pass
+        elif new_mat is not None:
             try:
                 bpy.data.materials.remove(new_mat)
             except (AttributeError, RuntimeError, TypeError):
@@ -1853,45 +2378,91 @@ def convert_material(
 def convert_object_materials(
     obj: bpy.types.Object,
     gamma_value: float = 2.2,
+    smart_conversion: bool = True,
+    auto_arrange: bool = True,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[bpy.types.Material]:
     """Convert all Cycles materials on a single object."""
-    converted = []
-    if obj is None or not hasattr(obj, "material_slots"):
-        return converted
+    return convert_objects_materials(
+        [obj] if obj is not None else [],
+        gamma_value=gamma_value,
+        smart_conversion=smart_conversion,
+        auto_arrange=auto_arrange,
+        progress_callback=progress_callback,
+        reset_conversion_cache=False,
+    )
 
-    for slot in obj.material_slots:
-        mat = slot.material
-        if mat is None:
+
+def convert_objects_materials(
+    objects: Iterable[bpy.types.Object],
+    gamma_value: float = 2.2,
+    smart_conversion: bool = True,
+    auto_arrange: bool = True,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    reset_conversion_cache: bool = True,
+) -> list[bpy.types.Material]:
+    """Convert material slots across a deterministic object collection."""
+    if reset_conversion_cache:
+        reset_cache()
+
+    work_items = []
+    for obj in objects:
+        if obj is None or not hasattr(obj, "material_slots"):
             continue
+        for slot in obj.material_slots:
+            if slot.material is not None:
+                work_items.append((obj, slot))
 
-        new_mat = convert_material(mat, gamma_value=gamma_value, obj=obj)
+    converted: list[bpy.types.Material] = []
+    converted_ids: set[int] = set()
+    total = len(work_items)
+    if progress_callback is not None:
+        progress_callback(0, 1000, "Preparing materials")
+
+    for index, (obj, slot) in enumerate(work_items, start=1):
+        mat = slot.material
+        label = getattr(mat, "name", getattr(obj, "name", "Material"))
+
+        def _material_progress(fraction: float, detail: str) -> None:
+            if progress_callback is None:
+                return
+            clamped = min(1.0, max(0.0, float(fraction)))
+            overall = ((index - 1) + clamped) / max(1, total)
+            progress_callback(round(overall * 1000), 1000, detail)
+
+        new_mat = convert_material(
+            mat,
+            gamma_value=gamma_value,
+            obj=obj,
+            smart_conversion=smart_conversion,
+            auto_arrange=auto_arrange,
+            progress_callback=_material_progress,
+        )
         if new_mat is not None:
             slot.material = new_mat
-            converted.append(new_mat)
+            identity = _rna_identity(new_mat)
+            if identity not in converted_ids:
+                converted.append(new_mat)
+                converted_ids.add(identity)
+        if progress_callback is not None:
+            _material_progress(1.0, label)
 
     return converted
 
 
 def convert_scene_materials(
     gamma_value: float = 2.2,
+    smart_conversion: bool = True,
+    auto_arrange: bool = True,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[bpy.types.Material]:
     """Convert all Cycles materials across all objects in the scene."""
-    reset_cache()
-    converted = []
-
-    # Filter objects with material slots
     objects = [obj for obj in bpy.context.scene.objects if hasattr(obj, "material_slots")]
-    total = len(objects)
-
-    wm = bpy.context.window_manager
-    wm.progress_begin(0, max(1, total))
-
-    try:
-        for i, obj in enumerate(objects):
-            results = convert_object_materials(obj, gamma_value=gamma_value)
-            converted.extend(results)
-            wm.progress_update(i + 1)
-    finally:
-        wm.progress_end()
-
-    return converted
+    return convert_objects_materials(
+        objects,
+        gamma_value=gamma_value,
+        smart_conversion=smart_conversion,
+        auto_arrange=auto_arrange,
+        progress_callback=progress_callback,
+        reset_conversion_cache=True,
+    )
