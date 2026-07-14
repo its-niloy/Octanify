@@ -11,6 +11,7 @@ conversion engine.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Callable
 
 from .node_registry import (
@@ -23,12 +24,21 @@ from .node_registry import (
     get_contextual_node_candidates,
 )
 from ..utils.logger import get_logger
+from .shading_intent import Role, ShadingIntentMap, TextureTreatment
 
 if TYPE_CHECKING:
     import bpy
     from .shader_detection import TreeAnalysis
 
 log = get_logger()
+
+
+def _rna_identity(value) -> int:
+    """Return a stable identity for Blender RNA wrappers and test doubles."""
+    try:
+        return int(value.as_pointer())
+    except (AttributeError, ReferenceError, TypeError):
+        return id(value)
 
 
 class GraphEngine:
@@ -40,11 +50,17 @@ class GraphEngine:
         group_converter_cb=None,
         context_name: str = "",
         reuse_output_nodes: bool = True,
+        intent_map: ShadingIntentMap | None = None,
+        source_tree=None,
+        report_context_name: str = "",
     ) -> None:
         self.analysis = analysis
         self.group_converter_cb = group_converter_cb
         self.context_name = context_name
+        self.report_context_name = report_context_name or context_name
         self.reuse_output_nodes = reuse_output_nodes
+        self.intent_map = intent_map
+        self.source_tree = source_tree
         # Ordered list of node names to convert (dependencies first)
         self._schedule: list[str] = []
         self._visited: set[str] = set()
@@ -59,6 +75,16 @@ class GraphEngine:
         # appropriate variant.
         self._created_variants: dict[str, list["bpy.types.Node"]] = {}
         self._output_variants: dict[tuple[str, str], "bpy.types.Node"] = {}
+        self._image_role_variants: dict[
+            str, dict[TextureTreatment, "bpy.types.Node"]
+        ] = {}
+        self._node_treatment_variants: dict[
+            str, dict[TextureTreatment, list["bpy.types.Node"]]
+        ] = {}
+        self._output_treatment_variants: dict[
+            tuple[str, str, TextureTreatment], "bpy.types.Node"
+        ] = {}
+        self._image_treatment_by_identity: dict[int, TextureTreatment] = {}
         selected_cycles_outputs = {
             name
             for name, info in self.analysis.nodes.items()
@@ -191,17 +217,355 @@ class GraphEngine:
         node = node_map.get(node_name)
         return [node] if node is not None else []
 
+    def _source_node(self, node_name: str):
+        if self.source_tree is None:
+            return None
+        nodes = getattr(self.source_tree, "nodes", ())
+        getter = getattr(nodes, "get", None)
+        if callable(getter):
+            node = getter(node_name)
+            if node is not None:
+                return node
+        return next(
+            (node for node in nodes if getattr(node, "name", "") == node_name),
+            None,
+        )
+
+    def intent_roles_for(self, node_name: str) -> set[Role]:
+        """Return the destination-role union for a source node."""
+        source = self._source_node(node_name)
+        if source is None or self.intent_map is None:
+            return set()
+        return self.intent_map.roles_for(source)
+
+    def intent_treatments_for(self, node_name: str) -> set[TextureTreatment]:
+        """Return the color/data treatment union for a source node."""
+        source = self._source_node(node_name)
+        if source is None or self.intent_map is None:
+            return set()
+        return self.intent_map.treatments_for(source)
+
+    def intent_treatments_for_link(self, link_info) -> set[TextureTreatment]:
+        """Return path treatments carried by one analyzed source-tree edge."""
+        if self.intent_map is None:
+            return set()
+        from_node = self._source_node(link_info.from_node)
+        to_node = self._source_node(link_info.to_node)
+        if from_node is None or to_node is None:
+            return set()
+        return self.intent_map.treatments_for_link(
+            from_node,
+            link_info.from_socket,
+            to_node,
+            link_info.to_socket,
+        )
+
+    def image_variants_for(
+        self,
+        node_name: str,
+        node_map: dict[str, "bpy.types.Node"],
+    ) -> list[tuple["bpy.types.Node", TextureTreatment | None]]:
+        """Return converted image variants paired with their treatment."""
+        variants = self._image_role_variants.get(node_name)
+        if variants:
+            return [(node, treatment) for treatment, node in variants.items()]
+        node = node_map.get(node_name)
+        if node is None:
+            return []
+        return [(node, self._image_treatment_by_identity.get(
+            _rna_identity(node)
+        ))]
+
+    @staticmethod
+    def _tag_image_treatment(node, node_name: str,
+                             treatment: TextureTreatment) -> None:
+        try:
+            node["octanify_source_node"] = node_name
+            node["octanify_intent_treatment"] = treatment.value
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+    def _register_image_treatment(
+        self,
+        node_name: str,
+        node,
+        treatment: TextureTreatment,
+    ) -> None:
+        self._image_treatment_by_identity[_rna_identity(node)] = treatment
+        self._tag_image_treatment(node, node_name, treatment)
+        self._register_node_treatment_variant(node_name, node, treatment)
+
+    def _register_node_treatment_variant(
+        self,
+        node_name: str,
+        node,
+        treatment: TextureTreatment,
+    ) -> None:
+        variants = self._node_treatment_variants.setdefault(node_name, {})
+        nodes = variants.setdefault(treatment, [])
+        if all(
+            _rna_identity(candidate) != _rna_identity(node)
+            for candidate in nodes
+        ):
+            nodes.append(node)
+
+    @staticmethod
+    def _ordered_treatments(
+        treatments: set[TextureTreatment],
+    ) -> list[TextureTreatment]:
+        return [
+            treatment
+            for treatment in (TextureTreatment.COLOR, TextureTreatment.DATA)
+            if treatment in treatments
+        ]
+
+    def _create_image_conflict_variant(
+        self,
+        target_tree: "bpy.types.NodeTree",
+        node_name: str,
+        info,
+        color_node: "bpy.types.Node",
+    ) -> "bpy.types.Node | None":
+        """Create the linear image instance for a color/data conflict."""
+        roles = self.intent_roles_for(node_name)
+        data_roles = roles & {
+            Role.ROUGHNESS,
+            Role.METALLIC,
+            Role.NORMAL,
+            Role.BUMP,
+            Role.ALPHA,
+            Role.DISPLACEMENT,
+        }
+        source_node = self._source_node(node_name)
+        alpha_output_is_data = bool(
+            source_node is not None
+            and self.intent_map is not None
+            and Role.ALPHA in self.intent_map.roles_for(source_node, "Alpha")
+            and all(
+                socket_name == "Alpha"
+                or TextureTreatment.DATA not in treatments
+                for (candidate, socket_name), treatments
+                in self.intent_map.output_treatments.items()
+                if _rna_identity(candidate) == _rna_identity(source_node)
+            )
+        )
+        candidates = (
+            ("OctaneAlphaImage", "ShaderNodeOctAlphaImage")
+            if data_roles == {Role.ALPHA} and alpha_output_is_data
+            else (
+                "OctaneRGBImage",
+                "ShaderNodeOctImageTex",
+                "OctaneImageTexture",
+            )
+        )
+        data_node = create_node_from_candidates(
+            target_tree,
+            candidates,
+            label=f"{info.label} [Data]",
+        )
+        if data_node is None:
+            from .report import report_data
+            report_data.add_warning(
+                f"[{self.report_context_name or target_tree.name}] "
+                f"Could not split color/data texture '{node_name}'"
+            )
+            return None
+
+        data_node.location = (info.location[0], info.location[1] - 180)
+        self._apply_common_state(data_node, info)
+        self._created_variants[node_name] = [color_node, data_node]
+        self._image_role_variants[node_name] = {
+            TextureTreatment.COLOR: color_node,
+            TextureTreatment.DATA: data_node,
+        }
+        self._register_image_treatment(
+            node_name, color_node, TextureTreatment.COLOR
+        )
+        self._register_image_treatment(
+            node_name, data_node, TextureTreatment.DATA
+        )
+
+        filepath = info.properties.get("filepath", "")
+        filename = (
+            os.path.basename(filepath.replace("\\", "/"))
+            if filepath else ""
+        )
+        filename = filename or info.properties.get("image_name", node_name)
+        message = (
+            f"[{self.report_context_name or target_tree.name}] '{filename}' used "
+            "for both color and data roles — created 2 texture instances."
+        )
+        from .report import report_data
+        report_data.add_notice(message)
+        log.info(message)
+        return data_node
+
+    def _output_variant_for_treatment(
+        self,
+        link_info,
+        treatment: TextureTreatment,
+    ):
+        identifier = getattr(link_info, "from_socket_identifier", "")
+        for socket_key in (identifier, link_info.from_socket):
+            if not socket_key:
+                continue
+            variant = self._output_treatment_variants.get(
+                (link_info.from_node, socket_key, treatment)
+            )
+            if variant is not None:
+                return variant
+        return None
+
+    def _source_node_for_treatment(
+        self,
+        link_info,
+        node_map: dict[str, "bpy.types.Node"],
+        treatment: TextureTreatment,
+    ):
+        output_variant = self._output_variant_for_treatment(
+            link_info, treatment
+        )
+        if output_variant is not None:
+            return output_variant
+
+        treatment_nodes = self._node_treatment_variants.get(
+            link_info.from_node, {}
+        ).get(treatment, [])
+        if treatment_nodes:
+            return treatment_nodes[0]
+
+        identifier = getattr(link_info, "from_socket_identifier", "")
+        output_variant = self._output_variants.get(
+            (link_info.from_node, identifier)
+        )
+        if output_variant is None:
+            output_variant = self._output_variants.get(
+                (link_info.from_node, link_info.from_socket)
+            )
+        if output_variant is not None:
+            return output_variant
+        return node_map.get(link_info.from_node)
+
+    def link_node_pairs(
+        self,
+        link_info,
+        node_map: dict[str, "bpy.types.Node"],
+    ) -> list[tuple["bpy.types.Node", "bpy.types.Node"]]:
+        """Return source/target pairs for one original edge.
+
+        When an upstream edge carries both color and data intent, every
+        duplicated processor branch must receive the matching image variant.
+        A simple source-to-all-target fan-out would attach the color instance
+        to both branches and leave the linear instance unused.
+        """
+        treatments = self.intent_treatments_for_link(link_info)
+        target_variants = self._node_treatment_variants.get(
+            link_info.to_node, {}
+        )
+        pairs: list[tuple["bpy.types.Node", "bpy.types.Node"]] = []
+
+        if treatments and target_variants:
+            for treatment in self._ordered_treatments(treatments):
+                source = self._source_node_for_treatment(
+                    link_info, node_map, treatment
+                )
+                if source is None:
+                    continue
+                for target in target_variants.get(treatment, []):
+                    pairs.append((source, target))
+        elif len(treatments) == 1:
+            treatment = next(iter(treatments))
+            source = self._source_node_for_treatment(
+                link_info, node_map, treatment
+            )
+            targets = self.created_nodes_for(link_info.to_node, node_map)
+            if source is not None:
+                pairs.extend((source, target) for target in targets)
+
+        if pairs:
+            matched_targets = {
+                _rna_identity(target) for _source, target in pairs
+            }
+            fallback_source = self.source_node_for(link_info, node_map)
+            if fallback_source is not None:
+                for target in self.created_nodes_for(
+                    link_info.to_node, node_map
+                ):
+                    if _rna_identity(target) not in matched_targets:
+                        pairs.append((fallback_source, target))
+
+        if not pairs:
+            source = self.source_node_for(link_info, node_map)
+            if source is not None:
+                pairs.extend(
+                    (source, target)
+                    for target in self.created_nodes_for(
+                        link_info.to_node, node_map
+                    )
+                )
+
+        unique: list[tuple["bpy.types.Node", "bpy.types.Node"]] = []
+        seen: set[tuple[int, int]] = set()
+        for source, target in pairs:
+            key = _rna_identity(source), _rna_identity(target)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((source, target))
+        return unique
+
     def source_node_for(
         self,
         link_info,
         node_map: dict[str, "bpy.types.Node"],
     ):
+        treatments = self.intent_treatments_for_link(link_info)
+        if len(treatments) == 1:
+            return self._source_node_for_treatment(
+                link_info, node_map, next(iter(treatments))
+            )
+
         identifier = getattr(link_info, "from_socket_identifier", "")
-        return (
-            self._output_variants.get((link_info.from_node, identifier))
-            or self._output_variants.get((link_info.from_node, link_info.from_socket))
-            or node_map.get(link_info.from_node)
+        output_variant = self._output_variants.get(
+            (link_info.from_node, identifier)
         )
+        if output_variant is None:
+            output_variant = self._output_variants.get(
+                (link_info.from_node, link_info.from_socket)
+            )
+        if output_variant is not None:
+            return output_variant
+
+        image_variants = self._image_role_variants.get(link_info.from_node)
+        if image_variants:
+            treatments = self.intent_treatments_for_link(link_info)
+            if treatments == {TextureTreatment.DATA}:
+                preferred = image_variants.get(TextureTreatment.DATA)
+                return preferred if preferred is not None else image_variants.get(
+                    TextureTreatment.COLOR
+                )
+            if treatments == {TextureTreatment.COLOR}:
+                preferred = image_variants.get(TextureTreatment.COLOR)
+                return preferred if preferred is not None else image_variants.get(
+                    TextureTreatment.DATA
+                )
+            if link_info.from_socket == "Alpha":
+                preferred = image_variants.get(TextureTreatment.DATA)
+                return preferred if preferred is not None else image_variants.get(
+                    TextureTreatment.COLOR
+                )
+            preferred = image_variants.get(TextureTreatment.COLOR)
+            return preferred if preferred is not None else image_variants.get(
+                TextureTreatment.DATA
+            )
+        treatment_variants = self._node_treatment_variants.get(
+            link_info.from_node, {}
+        )
+        for treatment in (TextureTreatment.COLOR, TextureTreatment.DATA):
+            nodes = treatment_variants.get(treatment, [])
+            if nodes:
+                return nodes[0]
+        return node_map.get(link_info.from_node)
 
     def is_skipped_material_output(self, node_name: str) -> bool:
         """Return whether an inactive duplicate output was intentionally omitted."""
@@ -247,21 +611,49 @@ class GraphEngine:
         for channel in used_channels:
             names = (channel, channel[0])
             socket = next(
-                (primary.outputs.get(name) for name in names if primary.outputs.get(name) is not None),
+                (
+                    primary.outputs.get(name)
+                    for name in names
+                    if primary.outputs.get(name) is not None
+                ),
                 None,
             )
             if socket is not None:
                 native_outputs.append(socket)
         if (len(native_outputs) == len(used_channels)
-                and len({id(socket) for socket in native_outputs}) == len(used_channels)):
+                and len({_rna_identity(socket) for socket in native_outputs})
+                == len(used_channels)):
             return primary
 
-        variants: dict[str, "bpy.types.Node"] = {}
-        for index, channel in enumerate(used_channels):
+        channel_treatments: dict[str, set[TextureTreatment]] = {
+            channel: set() for channel in used_channels
+        }
+        for link in outgoing:
+            channel = channel_aliases[link.from_socket]
+            channel_treatments[channel].update(
+                self.intent_treatments_for_link(link)
+            )
+
+        variant_specs: list[tuple[str, TextureTreatment | None]] = []
+        for channel in used_channels:
+            treatments = self._ordered_treatments(
+                channel_treatments[channel]
+            )
+            variant_specs.extend(
+                (channel, treatment) for treatment in treatments
+            )
+            if not treatments:
+                variant_specs.append((channel, None))
+
+        variants: dict[
+            tuple[str, TextureTreatment | None], "bpy.types.Node"
+        ] = {}
+        for index, (channel, treatment) in enumerate(variant_specs):
+            treatment_label = f" {treatment.value.title()}" if treatment else ""
             variant = create_node_from_candidates(
                 target_tree,
                 ("ShaderNodeOctChannelPickerTex", "OctaneChannelPicker"),
-                label=f"{info.label} [{channel}]",
+                label=f"{info.label} [{channel}{treatment_label}]",
             )
             if variant is None:
                 continue
@@ -272,7 +664,9 @@ class GraphEngine:
             self._apply_common_state(variant, info)
             configured = False
             channel_input = variant.inputs.get("Channel")
-            if channel_input is not None and hasattr(channel_input, "default_value"):
+            if channel_input is not None and hasattr(
+                channel_input, "default_value"
+            ):
                 enum_value = {
                     "Red": "1",
                     "Green": "2",
@@ -293,17 +687,40 @@ class GraphEngine:
                     configured = True
                 except (AttributeError, TypeError):
                     continue
-            variants[channel] = variant
+            variants[(channel, treatment)] = variant
+            if treatment is not None:
+                self._register_node_treatment_variant(
+                    node_name, variant, treatment
+                )
 
         for link in outgoing:
-            variant = variants.get(channel_aliases[link.from_socket])
-            if variant is not None:
-                self._output_variants[(node_name, link.from_socket)] = variant
+            channel = channel_aliases[link.from_socket]
+            treatments = self._ordered_treatments(
+                self.intent_treatments_for_link(link)
+            )
+            candidates = treatments or [None]
+            for treatment in candidates:
+                variant = variants.get((channel, treatment))
+                if variant is None:
+                    continue
+                self._output_variants.setdefault(
+                    (node_name, link.from_socket), variant
+                )
                 identifier = getattr(link, "from_socket_identifier", "")
                 if identifier:
-                    self._output_variants[(node_name, identifier)] = variant
+                    self._output_variants.setdefault(
+                        (node_name, identifier), variant
+                    )
+                if treatment is not None:
+                    self._output_treatment_variants[
+                        (node_name, link.from_socket, treatment)
+                    ] = variant
+                    if identifier:
+                        self._output_treatment_variants[
+                            (node_name, identifier, treatment)
+                        ] = variant
 
-        if len(variants) == len(used_channels):
+        if len(variants) == len(variant_specs):
             try:
                 target_tree.nodes.remove(primary)
             except (RuntimeError, TypeError):
@@ -316,8 +733,62 @@ class GraphEngine:
             self._created_variants[node_name] = [primary, *variants.values()]
         from .report import report_data
         report_data.add_warning(
-            f"[{self.context_name or target_tree.name}] Could not create all Channel Picker variants "
-            f"for '{node_name}' ({len(variants)}/{len(used_channels)})"
+            f"[{self.context_name or target_tree.name}] Could not create all "
+            f"Channel Picker variants for '{node_name}' "
+            f"({len(variants)}/{len(variant_specs)})"
+        )
+        return primary
+
+    def _expand_mixed_treatment_node(
+        self,
+        target_tree: "bpy.types.NodeTree",
+        node_name: str,
+        info,
+        primary: "bpy.types.Node",
+        cycles_type: str,
+        preferred_candidates: list[str],
+    ) -> "bpy.types.Node":
+        """Duplicate a shared processor chain for color and data branches."""
+        if info.bl_idname == "ShaderNodeTexImage":
+            return primary
+        if node_name in self._created_variants:
+            return primary
+        if self.intent_treatments_for(node_name) != {
+            TextureTreatment.COLOR,
+            TextureTreatment.DATA,
+        }:
+            return primary
+        if not any(
+            self.intent_treatments_for_link(link)
+            for link in self._incoming.get(node_name, [])
+        ):
+            # Constants and procedural producers can safely fan out to both
+            # treatments. Only a shared processing chain needs duplication.
+            return primary
+
+        data_node = create_octane_node(
+            target_tree,
+            cycles_type,
+            label=f"{info.label} [Data]",
+            preferred_candidates=preferred_candidates,
+        )
+        if data_node is None:
+            from .report import report_data
+            report_data.add_warning(
+                f"[{self.report_context_name or target_tree.name}] Could not "
+                f"duplicate mixed-intent processor '{node_name}'"
+            )
+            return primary
+
+        primary.label = f"{info.label} [Color]"
+        data_node.location = (info.location[0], info.location[1] - 180)
+        self._apply_common_state(data_node, info)
+        self._created_variants[node_name] = [primary, data_node]
+        self._register_node_treatment_variant(
+            node_name, primary, TextureTreatment.COLOR
+        )
+        self._register_node_treatment_variant(
+            node_name, data_node, TextureTreatment.DATA
         )
         return primary
 
@@ -412,6 +883,19 @@ class GraphEngine:
                 node_name,
                 outgoing_links=self._outgoing.get(node_name, []),
             )
+            image_treatments = (
+                self.intent_treatments_for(node_name)
+                if info.bl_idname == "ShaderNodeTexImage"
+                else set()
+            )
+            if TextureTreatment.COLOR in image_treatments:
+                # A role-resolved color branch must retain all RGB channels,
+                # even when another branch from the source is scalar data.
+                preferred_candidates = [
+                    "OctaneRGBImage",
+                    "ShaderNodeOctImageTex",
+                    "OctaneImageTexture",
+                ]
             new_node = create_octane_node(
                 target_tree,
                 bl_id,
@@ -425,7 +909,41 @@ class GraphEngine:
                 new_node = self._expand_channel_split(
                     target_tree, node_name, info, new_node
                 )
+                new_node = self._expand_mixed_treatment_node(
+                    target_tree,
+                    node_name,
+                    info,
+                    new_node,
+                    bl_id,
+                    preferred_candidates,
+                )
                 node_map[node_name] = new_node
+
+                if info.bl_idname == "ShaderNodeTexImage":
+                    if image_treatments == {
+                        TextureTreatment.COLOR,
+                        TextureTreatment.DATA,
+                    }:
+                        data_variant = self._create_image_conflict_variant(
+                            target_tree, node_name, info, new_node
+                        )
+                        if data_variant is None:
+                            self._image_role_variants[node_name] = {
+                                TextureTreatment.COLOR: new_node
+                            }
+                            self._register_image_treatment(
+                                node_name,
+                                new_node,
+                                TextureTreatment.COLOR,
+                            )
+                    elif len(image_treatments) == 1:
+                        treatment = next(iter(image_treatments))
+                        self._image_role_variants[node_name] = {
+                            treatment: new_node
+                        }
+                        self._register_image_treatment(
+                            node_name, new_node, treatment
+                        )
 
                 from .report import report_data
                 report_data.nodes_translated += 1

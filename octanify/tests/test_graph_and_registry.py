@@ -47,6 +47,7 @@ _install_bpy_stub()
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from octanify.core.graph_engine import GraphEngine
+from octanify.core.gamma_system import apply_gamma
 from octanify.core.layout_engine import style_smart_graphs
 from octanify.core.conversion_engine import (
     _apply_scale_correction,
@@ -73,6 +74,12 @@ from octanify.core.property_mapper import (
     _transfer_principled,
 )
 from octanify.core.report import report_data
+from octanify.core.shading_intent import (
+    Role,
+    ShadingIntentMap,
+    TextureTreatment,
+    trace_shading_intent,
+)
 from octanify.core.shader_detection import analyze_tree
 from octanify.core.volumetric_handler import handle_volumetrics
 from octanify.ui.operators import (
@@ -169,12 +176,73 @@ class _Nodes(list):
             _attach_sockets(node)
             self.append(node)
             return node
+        if type in (
+            "OctaneRGBImage",
+            "ShaderNodeOctImageTex",
+            "OctaneImageTexture",
+            "OctaneGreyscaleImage",
+            "ShaderNodeOctGreyscaleImage",
+        ):
+            node = _Node(
+                "Image",
+                type,
+                inputs=[_Socket("Legacy gamma", 1.0)],
+                outputs=[_Socket("Texture out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
         if type in ("OctaneMultiplyTexture", "ShaderNodeOctMultiplyTex"):
             node = _Node(
                 "Multiply",
                 type,
                 inputs=[_Socket("Texture 1", None), _Socket("Texture 2", 1.0)],
                 outputs=[_Socket("Texture out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in (
+            "OctaneSeparateColor",
+            "ShaderNodeOctColorCorrectionTex",
+            "OctaneColorCorrection",
+        ):
+            node = _Node(
+                "Separate",
+                type,
+                inputs=[_Socket("Input", None)],
+                outputs=[_Socket("OutTex")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in (
+            "OctaneCyclesNodeMathNodeWrapper",
+            "OctaneBinaryMathOperation",
+        ):
+            node = _Node(
+                "Math",
+                type,
+                inputs=[_Socket("Value 1", None), _Socket("Value 2", 1.0)],
+                outputs=[_Socket("Value")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in (
+            "OctaneStandardSurfaceMaterial",
+            "ShaderNodeOctStandardSurfaceMat",
+            "OctaneUniversalMaterial",
+            "ShaderNodeOctUniversalMat",
+        ):
+            node = _Node(
+                "Material",
+                type,
+                inputs=[
+                    _Socket("Base color", None),
+                    _Socket("Specular roughness", None),
+                ],
+                outputs=[_Socket("Material out")],
             )
             _attach_sockets(node)
             self.append(node)
@@ -187,6 +255,7 @@ class _Nodes(list):
             inputs=[
                 _Socket("Texture", (0.0, 0.0, 0.0, 1.0)),
                 _Socket("Power", 1.0),
+                _Socket("Surface brightness", False),
             ],
             outputs=[_Socket("OutEmission")],
         )
@@ -476,6 +545,303 @@ class TreeAnalysisTests(unittest.TestCase):
         self.assertTrue(
             analysis.nodes["Cycles Output"].properties["octanify_cycles_output"]
         )
+
+
+class ShadingIntentTests(unittest.TestCase):
+    @staticmethod
+    def _material_output():
+        return _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[
+                    _Socket("Surface", None),
+                    _Socket("Displacement", None),
+                ],
+            )
+        )
+
+    def test_roles_are_per_output_and_per_path(self) -> None:
+        image = _attach_sockets(
+            _Node(
+                "Image",
+                "ShaderNodeTexImage",
+                outputs=[_Socket("Color"), _Socket("Alpha")],
+            )
+        )
+        separate = _attach_sockets(
+            _Node(
+                "Separate",
+                "ShaderNodeSeparateColor",
+                inputs=[_Socket("Color", None)],
+                outputs=[_Socket("Red")],
+            )
+        )
+        math = _attach_sockets(
+            _Node(
+                "Math",
+                "ShaderNodeMath",
+                inputs=[_Socket("Value", 0.0)],
+                outputs=[_Socket("Value")],
+            )
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[
+                    _Socket("Base Color", (0.8, 0.8, 0.8, 1.0)),
+                    _Socket("Roughness", 0.5),
+                ],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(image.outputs.get("Color"), shader.inputs.get("Base Color"))
+        links.new(image.outputs.get("Color"), separate.inputs.get("Color"))
+        links.new(separate.outputs.get("Red"), math.inputs.get("Value"))
+        links.new(math.outputs.get("Value"), shader.inputs.get("Roughness"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+
+        intent = trace_shading_intent(output)
+
+        self.assertEqual(
+            intent.roles_for(image, "Color"),
+            {Role.ALBEDO, Role.ROUGHNESS},
+        )
+        self.assertEqual(
+            intent.treatments_for_link(
+                image, "Color", shader, "Base Color"
+            ),
+            {TextureTreatment.COLOR},
+        )
+        self.assertEqual(
+            intent.treatments_for_link(
+                image, "Color", separate, "Color"
+            ),
+            {TextureTreatment.DATA},
+        )
+
+    def test_alpha_output_is_detected_only_on_alpha_destination_path(self) -> None:
+        image = _attach_sockets(
+            _Node(
+                "Image",
+                "ShaderNodeTexImage",
+                outputs=[_Socket("Color"), _Socket("Alpha")],
+            )
+        )
+        math = _attach_sockets(
+            _Node(
+                "Math",
+                "ShaderNodeMath",
+                inputs=[_Socket("Value", 0.0)],
+                outputs=[_Socket("Value")],
+            )
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[_Socket("Alpha", 1.0)],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(image.outputs.get("Alpha"), math.inputs.get("Value"))
+        links.new(math.outputs.get("Value"), shader.inputs.get("Alpha"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+
+        intent = trace_shading_intent(output)
+
+        self.assertEqual(intent.roles_for(image, "Alpha"), {Role.ALPHA})
+        self.assertNotIn((image, "Color"), intent)
+
+    def test_reroute_is_transparent_and_records_flattened_edge_intent(self) -> None:
+        image = _attach_sockets(
+            _Node("Image", "ShaderNodeTexImage", outputs=[_Socket("Color")])
+        )
+        reroute = _attach_sockets(
+            _Node(
+                "Reroute",
+                "NodeReroute",
+                inputs=[_Socket("Input", None)],
+                outputs=[_Socket("Output")],
+            )
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[_Socket("Roughness", 0.5)],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(image.outputs.get("Color"), reroute.inputs.get("Input"))
+        links.new(reroute.outputs.get("Output"), shader.inputs.get("Roughness"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+
+        intent = trace_shading_intent(output)
+
+        self.assertEqual(intent.roles_for(image, "Color"), {Role.ROUGHNESS})
+        self.assertEqual(intent.roles_for(reroute), set())
+        self.assertEqual(
+            intent.treatments_for_link(
+                image, "Color", shader, "Roughness"
+            ),
+            {TextureTreatment.DATA},
+        )
+
+    def test_three_nested_groups_cross_both_boundaries(self) -> None:
+        def passthrough_tree(name: str, source_node=None):
+            group_input = _attach_sockets(
+                _Node(
+                    f"{name} Input",
+                    "NodeGroupInput",
+                    outputs=[_Socket("In")],
+                )
+            )
+            group_output = _attach_sockets(
+                _Node(
+                    f"{name} Output",
+                    "NodeGroupOutput",
+                    inputs=[_Socket("Out", None)],
+                )
+            )
+            links = _Links()
+            nodes = _Nodes([group_input, group_output])
+            if source_node is None:
+                links.new(group_input.outputs.get("In"), group_output.inputs.get("Out"))
+            else:
+                nodes.insert(1, source_node)
+                links.new(group_input.outputs.get("In"), source_node.inputs.get("In"))
+                links.new(source_node.outputs.get("Out"), group_output.inputs.get("Out"))
+            return SimpleNamespace(name=name, nodes=nodes, links=links)
+
+        group3 = _attach_sockets(
+            _Node(
+                "Group 3",
+                "ShaderNodeGroup",
+                inputs=[_Socket("In", None)],
+                outputs=[_Socket("Out")],
+            )
+        )
+        group3.node_tree = passthrough_tree("Level 3")
+        group2 = _attach_sockets(
+            _Node(
+                "Group 2",
+                "ShaderNodeGroup",
+                inputs=[_Socket("In", None)],
+                outputs=[_Socket("Out")],
+            )
+        )
+        group2.node_tree = passthrough_tree("Level 2", group3)
+        group1 = _attach_sockets(
+            _Node(
+                "Group 1",
+                "ShaderNodeGroup",
+                inputs=[_Socket("In", None)],
+                outputs=[_Socket("Out")],
+            )
+        )
+        group1.node_tree = passthrough_tree("Level 1", group2)
+
+        image = _attach_sockets(
+            _Node("Image", "ShaderNodeTexImage", outputs=[_Socket("Color")])
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[_Socket("Base Color", (0.8, 0.8, 0.8, 1.0))],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(image.outputs.get("Color"), group1.inputs.get("In"))
+        links.new(group1.outputs.get("Out"), shader.inputs.get("Base Color"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+
+        intent = trace_shading_intent(output)
+
+        self.assertEqual(intent.roles_for(image, "Color"), {Role.ALBEDO})
+        for group in (group1, group2, group3):
+            self.assertEqual(intent.roles_for(group, "Out"), {Role.ALBEDO})
+
+    def test_non_black_zero_strength_emission_is_active(self) -> None:
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[
+                    _Socket("Emission Color", (0.2, 0.1, 0.0, 1.0)),
+                    _Socket("Emission Strength", 0.0),
+                ],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+
+        intent = trace_shading_intent(output)
+
+        self.assertTrue(intent.has_active_emission())
+
+    def test_role_queries_use_stable_rna_identity(self) -> None:
+        original = _Node("Image", "ShaderNodeTexImage")
+        wrapper = _Node("Image", "ShaderNodeTexImage")
+        original.as_pointer = lambda: 4242
+        wrapper.as_pointer = lambda: 4242
+        intent = ShadingIntentMap()
+        intent.add_output(
+            original,
+            "Color",
+            Role.ALBEDO,
+            TextureTreatment.COLOR,
+        )
+
+        self.assertEqual(intent.roles_for(wrapper), {Role.ALBEDO})
+        self.assertEqual(
+            intent.treatments_for(wrapper, "Color"),
+            {TextureTreatment.COLOR},
+        )
+
+    def test_depth_cap_logs_once_and_stops_the_branch(self) -> None:
+        image = _attach_sockets(
+            _Node("Image", "ShaderNodeTexImage", outputs=[_Socket("Color")])
+        )
+        math = _attach_sockets(
+            _Node(
+                "Math",
+                "ShaderNodeMath",
+                inputs=[_Socket("Value", 0.0)],
+                outputs=[_Socket("Value")],
+            )
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[_Socket("Roughness", 0.5)],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(image.outputs.get("Color"), math.inputs.get("Value"))
+        links.new(math.outputs.get("Value"), shader.inputs.get("Roughness"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+
+        with patch("octanify.core.shading_intent.log.warning") as warning:
+            intent = trace_shading_intent(output, max_depth=1)
+
+        warning.assert_called_once()
+        self.assertNotIn((image, "Color"), intent)
 
 
 class OperatorUtilityTests(unittest.TestCase):
@@ -833,6 +1199,391 @@ class ContextualImageTests(unittest.TestCase):
         self.assertIs(material.inputs.get("Opacity").links[0].from_node, alpha_image)
 
 
+class IntentGammaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        report_data.clear()
+
+    @staticmethod
+    def _source_graph(colorspace: str, include_color_branch: bool):
+        image = _attach_sockets(
+            _Node(
+                "Image",
+                "ShaderNodeTexImage",
+                outputs=[_Socket("Color")],
+            )
+        )
+        image.image = SimpleNamespace(
+            name="packed.png",
+            filepath="//textures/packed.png",
+            colorspace_settings=SimpleNamespace(name=colorspace),
+        )
+        separate = _attach_sockets(
+            _Node(
+                "Separate",
+                "ShaderNodeSeparateColor",
+                inputs=[_Socket("Color", None)],
+                outputs=[_Socket("Red")],
+            )
+        )
+        shader_inputs = [_Socket("Roughness", 0.5)]
+        if include_color_branch:
+            shader_inputs.insert(0, _Socket("Base Color", (0.8, 0.8, 0.8, 1.0)))
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=shader_inputs,
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface", None), _Socket("Displacement", None)],
+            )
+        )
+        links = _Links()
+        if include_color_branch:
+            links.new(image.outputs.get("Color"), shader.inputs.get("Base Color"))
+        links.new(image.outputs.get("Color"), separate.inputs.get("Color"))
+        links.new(separate.outputs.get("Red"), shader.inputs.get("Roughness"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+        tree = SimpleNamespace(
+            name="Source",
+            nodes=_Nodes([image, separate, shader, output]),
+            links=links,
+        )
+        return tree, image, separate, shader, output
+
+    @staticmethod
+    def _image_analysis(colorspace: str):
+        info = SimpleNamespace(
+            name="Image",
+            bl_idname="ShaderNodeTexImage",
+            label="Packed",
+            location=(0.0, 0.0),
+            properties={
+                "colorspace": colorspace,
+                "image_name": "packed.png",
+                "filepath": "//textures/packed.png",
+            },
+        )
+        return SimpleNamespace(
+            nodes=OrderedDict((("Image", info),)),
+            links=[],
+        )
+
+    def test_srgb_color_data_conflict_creates_and_routes_two_instances(self) -> None:
+        source_tree, _image, separate, shader, output = self._source_graph(
+            "sRGB", True
+        )
+        intent = trace_shading_intent(output)
+        analysis = self._image_analysis("sRGB")
+        target_tree = SimpleNamespace(
+            name="Material_OCTANE", nodes=_Nodes(), links=_Links()
+        )
+        engine = GraphEngine(
+            analysis,
+            intent_map=intent,
+            source_tree=source_tree,
+            report_context_name="Material",
+        )
+        node_map = engine.create_nodes(target_tree)
+
+        color_link = _link(
+            "Image",
+            "Principled",
+            from_socket="Color",
+            to_socket="Base Color",
+        )
+        data_link = _link(
+            "Image",
+            "Separate",
+            from_socket="Color",
+            to_socket="Color",
+        )
+        color_node = engine.source_node_for(color_link, node_map)
+        data_node = engine.source_node_for(data_link, node_map)
+
+        self.assertIsNot(color_node, data_node)
+        self.assertEqual(len(engine.created_nodes_for("Image", node_map)), 2)
+        self.assertEqual(color_node.label, "Packed")
+        self.assertEqual(data_node.label, "Packed [Data]")
+        self.assertTrue(
+            any("created 2 texture instances" in notice for notice in report_data.notices)
+        )
+
+        material = SimpleNamespace(name="Material", node_tree=target_tree)
+        apply_gamma(
+            material,
+            2.2,
+            analysis=analysis,
+            node_map=node_map,
+            graph_engine=engine,
+        )
+
+        self.assertEqual(color_node.inputs.get("Legacy gamma").default_value, 2.2)
+        self.assertEqual(data_node.inputs.get("Legacy gamma").default_value, 1.0)
+        self.assertTrue(
+            any("feeds Roughness but is set to sRGB" in warning
+                for warning in report_data.warnings)
+        )
+
+    def test_shared_channel_split_pairs_each_texture_treatment(self) -> None:
+        image = _attach_sockets(
+            _Node("Image", "ShaderNodeTexImage", outputs=[_Socket("Color")])
+        )
+        image.image = SimpleNamespace(
+            name="packed.png",
+            filepath="//textures/packed.png",
+            colorspace_settings=SimpleNamespace(name="sRGB"),
+        )
+        separate = _attach_sockets(
+            _Node(
+                "Separate",
+                "ShaderNodeSeparateColor",
+                inputs=[_Socket("Color", None)],
+                outputs=[_Socket("Red"), _Socket("Green")],
+            )
+        )
+        separate.mode = "RGB"
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[
+                    _Socket("Base Color", (0.8, 0.8, 0.8, 1.0)),
+                    _Socket("Roughness", 0.5),
+                ],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface", None), _Socket("Displacement", None)],
+            )
+        )
+        links = _Links()
+        links.new(image.outputs.get("Color"), separate.inputs.get("Color"))
+        links.new(separate.outputs.get("Red"), shader.inputs.get("Base Color"))
+        links.new(separate.outputs.get("Green"), shader.inputs.get("Roughness"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+        source_tree = SimpleNamespace(
+            name="Shared Split",
+            nodes=_Nodes([image, separate, shader, output]),
+            links=links,
+        )
+        analysis = analyze_tree(source_tree)
+        intent = trace_shading_intent(output)
+        target_tree = SimpleNamespace(
+            name="Shared Split OCTANE", nodes=_Nodes(), links=_Links()
+        )
+        engine = GraphEngine(
+            analysis,
+            intent_map=intent,
+            source_tree=source_tree,
+            report_context_name="Shared Split",
+        )
+        node_map = engine.create_nodes(target_tree)
+
+        incoming = next(
+            link for link in analysis.links
+            if link.from_node == "Image" and link.to_node == "Separate"
+        )
+        red = next(
+            link for link in analysis.links
+            if link.from_node == "Separate" and link.from_socket == "Red"
+        )
+        green = next(
+            link for link in analysis.links
+            if link.from_node == "Separate" and link.from_socket == "Green"
+        )
+        pairs = engine.link_node_pairs(incoming, node_map)
+        variants = {
+            treatment: node
+            for node, treatment in engine.image_variants_for("Image", node_map)
+        }
+
+        self.assertEqual(len(pairs), 2)
+        self.assertIn(
+            (variants[TextureTreatment.COLOR], engine.source_node_for(red, node_map)),
+            pairs,
+        )
+        self.assertIn(
+            (variants[TextureTreatment.DATA], engine.source_node_for(green, node_map)),
+            pairs,
+        )
+
+    def test_shared_math_chain_is_duplicated_by_treatment(self) -> None:
+        image = _attach_sockets(
+            _Node("Image", "ShaderNodeTexImage", outputs=[_Socket("Color")])
+        )
+        image.image = SimpleNamespace(
+            name="packed.png",
+            filepath="//textures/packed.png",
+            colorspace_settings=SimpleNamespace(name="sRGB"),
+        )
+        math_node = _attach_sockets(
+            _Node(
+                "Math",
+                "ShaderNodeMath",
+                inputs=[_Socket("Value", 0.0), _Socket("Value", 1.0)],
+                outputs=[_Socket("Value")],
+            )
+        )
+        math_node.operation = "MULTIPLY"
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[
+                    _Socket("Base Color", (0.8, 0.8, 0.8, 1.0)),
+                    _Socket("Roughness", 0.5),
+                ],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface", None), _Socket("Displacement", None)],
+            )
+        )
+        links = _Links()
+        links.new(image.outputs.get("Color"), math_node.inputs[0])
+        links.new(math_node.outputs.get("Value"), shader.inputs.get("Base Color"))
+        links.new(math_node.outputs.get("Value"), shader.inputs.get("Roughness"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+        source_tree = SimpleNamespace(
+            name="Shared Math",
+            nodes=_Nodes([image, math_node, shader, output]),
+            links=links,
+        )
+        analysis = analyze_tree(source_tree)
+        intent = trace_shading_intent(output)
+        target_tree = SimpleNamespace(
+            name="Shared Math OCTANE", nodes=_Nodes(), links=_Links()
+        )
+        engine = GraphEngine(
+            analysis,
+            intent_map=intent,
+            source_tree=source_tree,
+            report_context_name="Shared Math",
+        )
+        node_map = engine.create_nodes(target_tree)
+
+        incoming = next(
+            link for link in analysis.links
+            if link.from_node == "Image" and link.to_node == "Math"
+        )
+        color_link = next(
+            link for link in analysis.links
+            if link.from_node == "Math" and link.to_socket == "Base Color"
+        )
+        data_link = next(
+            link for link in analysis.links
+            if link.from_node == "Math" and link.to_socket == "Roughness"
+        )
+        pairs = engine.link_node_pairs(incoming, node_map)
+
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(len(engine.created_nodes_for("Math", node_map)), 2)
+        self.assertIsNot(
+            engine.source_node_for(color_link, node_map),
+            engine.source_node_for(data_link, node_map),
+        )
+
+    def test_correct_non_color_roughness_stays_linear_without_warning(self) -> None:
+        source_tree, _image, _separate, _shader, output = self._source_graph(
+            "Non-Color", False
+        )
+        intent = trace_shading_intent(output)
+        analysis = self._image_analysis("Non-Color")
+        target_tree = SimpleNamespace(
+            name="Roughness_OCTANE", nodes=_Nodes(), links=_Links()
+        )
+        engine = GraphEngine(
+            analysis,
+            intent_map=intent,
+            source_tree=source_tree,
+            report_context_name="Roughness",
+        )
+        node_map = engine.create_nodes(target_tree)
+
+        apply_gamma(
+            SimpleNamespace(name="Roughness", node_tree=target_tree),
+            2.2,
+            analysis=analysis,
+            node_map=node_map,
+            graph_engine=engine,
+        )
+
+        node = node_map["Image"]
+        self.assertEqual(node.inputs.get("Legacy gamma").default_value, 1.0)
+        self.assertEqual(report_data.warnings, [])
+
+    def test_non_color_albedo_uses_color_gamma_and_warns(self) -> None:
+        image = _attach_sockets(
+            _Node("Image", "ShaderNodeTexImage", outputs=[_Socket("Color")])
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[_Socket("Base Color", (0.8, 0.8, 0.8, 1.0))],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface", None), _Socket("Displacement", None)],
+            )
+        )
+        links = _Links()
+        links.new(image.outputs.get("Color"), shader.inputs.get("Base Color"))
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+        source_tree = SimpleNamespace(
+            name="Source",
+            nodes=_Nodes([image, shader, output]),
+            links=links,
+        )
+        intent = trace_shading_intent(output)
+        analysis = self._image_analysis("Non-Color")
+        target_tree = SimpleNamespace(
+            name="Albedo_OCTANE", nodes=_Nodes(), links=_Links()
+        )
+        engine = GraphEngine(
+            analysis,
+            intent_map=intent,
+            source_tree=source_tree,
+            report_context_name="Albedo",
+        )
+        node_map = engine.create_nodes(target_tree)
+
+        apply_gamma(
+            SimpleNamespace(name="Albedo", node_tree=target_tree),
+            2.2,
+            analysis=analysis,
+            node_map=node_map,
+            graph_engine=engine,
+        )
+
+        node = node_map["Image"]
+        self.assertEqual(node.inputs.get("Legacy gamma").default_value, 2.2)
+        self.assertTrue(
+            any(
+                "feeds Base Color but is set to Non-Color" in warning
+                for warning in report_data.warnings
+            )
+        )
+
+
 class ChannelSplitExpansionTests(unittest.TestCase):
     def test_rgb_outputs_expand_to_distinct_channel_picker_nodes(self) -> None:
         primary = _attach_sockets(
@@ -966,6 +1717,50 @@ class EmissionReconstructionTests(unittest.TestCase):
             (0.1, 0.3, 0.8, 1.0),
         )
         self.assertEqual(emission_node.inputs.get("Power").default_value, 150.0)
+        self.assertIs(
+            material_node.inputs.get("Emission").links[0].from_node,
+            emission_node,
+        )
+
+    def test_zero_strength_non_black_principled_still_builds_emission(self) -> None:
+        material_node = _attach_sockets(
+            _Node(
+                "Converted Principled",
+                "OctaneStandardSurfaceMaterial",
+                inputs=[_Socket("Emission", None)],
+                outputs=[_Socket("OutMat")],
+            )
+        )
+        nodes = _Nodes([material_node])
+        tree = SimpleNamespace(name="ZeroEmission", nodes=nodes, links=_Links())
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeBsdfPrincipled",
+            inputs={
+                "Emission Color": (0.2, 0.1, 0.0, 1.0),
+                "Emission Strength": 0.0,
+            },
+            input_identifiers={
+                "Emission Color": "Emission Color",
+                "Emission Strength": "Emission Strength",
+            },
+        )
+        analysis = SimpleNamespace(
+            has_emission=True,
+            nodes={"Principled": info},
+            links=[],
+        )
+
+        _handle_emission_node_insertion(
+            analysis,
+            {"Principled": material_node},
+            tree,
+        )
+
+        emission_node = nodes[-1]
+        self.assertEqual(emission_node.inputs.get("Power").default_value, 0.0)
+        self.assertTrue(
+            emission_node.inputs.get("Surface brightness").default_value
+        )
         self.assertIs(
             material_node.inputs.get("Emission").links[0].from_node,
             emission_node,

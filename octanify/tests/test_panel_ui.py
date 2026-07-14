@@ -47,9 +47,11 @@ from octanify.ui.panel import (  # noqa: E402
     OCTANIFY_PT_shader_panel,
     _draw_albedo_controls,
     _draw_conversion_console,
+    _draw_last_report,
     _draw_node_tools,
     classes,
 )
+from octanify.core.report import report_data  # noqa: E402
 
 
 class _RecordingLayout:
@@ -103,6 +105,9 @@ def _scene(**overrides):
 
 
 class PanelHierarchyTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        report_data.clear()
+
     def test_primary_action_precedes_compact_conversion_choices(self) -> None:
         layout = _RecordingLayout()
         _draw_conversion_console(layout, SimpleNamespace(scene=_scene()))
@@ -237,6 +242,27 @@ class PanelHierarchyTests(unittest.TestCase):
             "Conversion Report",
         ):
             self.assertEqual(labels.count(label), 2)
+
+    def test_last_report_surfaces_intent_notices_and_warnings(self) -> None:
+        report_data.add_notice(
+            "[Mat] 'packed.png' used for both color and data roles"
+        )
+        report_data.add_warning(
+            "[Mat] 'roughness.png' feeds Roughness but is set to sRGB"
+        )
+        layout = _RecordingLayout()
+
+        _draw_last_report(layout, SimpleNamespace())
+
+        labels = [
+            event[1].get("text")
+            for event in layout.events
+            if event[0] == "label"
+        ]
+        self.assertIn("Notices (1)", labels)
+        self.assertIn("Warnings (1)", labels)
+        self.assertTrue(any("packed.png" in label for label in labels))
+        self.assertTrue(any("roughness.png" in label for label in labels))
 
 
 if __name__ == "__main__":

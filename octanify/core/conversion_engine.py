@@ -16,6 +16,7 @@ single Cycles material into an Octane material:
 
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING, Callable, Iterable
 
 import bpy
@@ -33,6 +34,7 @@ from .node_registry import (
     is_standard_surface_node,
 )
 from .gamma_system import apply_gamma
+from .shading_intent import Role, ShadingIntentMap, trace_shading_intent
 from .layout_engine import style_converted_graph, style_smart_graphs
 from .volumetric_handler import handle_volumetrics
 from .report import report_data
@@ -66,6 +68,81 @@ def get_cache() -> ConversionCache:
 
 def reset_cache() -> None:
     _cache.clear()
+
+
+def _selected_material_output(node_tree: bpy.types.NodeTree):
+    """Return Blender's Cycles output choice with deterministic fallbacks."""
+    try:
+        output = node_tree.get_output_node("CYCLES")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        output = None
+    if output is not None:
+        return output
+    outputs = [
+        node for node in node_tree.nodes
+        if getattr(node, "bl_idname", "") == "ShaderNodeOutputMaterial"
+    ]
+    return next(
+        (node for node in outputs if bool(getattr(node, "is_active_output", False))),
+        outputs[0] if outputs else None,
+    )
+
+
+def _apply_intent_flags(
+    analysis: TreeAnalysis,
+    intent_map: ShadingIntentMap | None,
+    source_tree: bpy.types.NodeTree,
+) -> None:
+    """Extend snapshot flags with path-aware alpha and emission findings."""
+    if intent_map is None:
+        return
+    source_ids = {_rna_identity(node) for node in source_tree.nodes}
+    if intent_map.has_active_emission():
+        analysis.has_emission = True
+    for (node, output_name), roles in intent_map.items():
+        if _rna_identity(node) not in source_ids:
+            continue
+        if (getattr(node, "bl_idname", "") == "ShaderNodeTexImage"
+                and output_name == "Alpha"
+                and Role.ALPHA in roles):
+            analysis.has_alpha = True
+            break
+
+
+def _group_intent_signature(
+    group_tree: bpy.types.NodeTree,
+    intent_map: ShadingIntentMap | None,
+) -> str:
+    """Return a stable cache discriminator for a group's path intent."""
+    if intent_map is None:
+        return "legacy"
+    node_ids = {_rna_identity(node) for node in group_tree.nodes}
+    parts: list[str] = []
+    for (node, socket_name), roles in intent_map.items():
+        if _rna_identity(node) not in node_ids:
+            continue
+        treatments = intent_map.treatments_for(node, socket_name)
+        parts.append(
+            ":".join((
+                getattr(node, "name", ""),
+                socket_name,
+                ",".join(sorted(role.value for role in roles)),
+                ",".join(sorted(value.value for value in treatments)),
+            ))
+        )
+    for (node, socket_name), roles in intent_map.terminal_inputs.items():
+        if _rna_identity(node) not in node_ids:
+            continue
+        parts.append(
+            "terminal:"
+            + ":".join((
+                getattr(node, "name", ""),
+                socket_name,
+                ",".join(sorted(role.value for role in roles)),
+            ))
+        )
+    payload = "|".join(sorted(parts)).encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:12]
 
 
 # ---------------------------------------------------------------------------
@@ -245,16 +322,17 @@ def _rebuild_links(
         from_sock_name = link_info.from_socket
         to_sock_name = link_info.to_socket
 
-        oct_from = (
-            graph_engine.source_node_for(link_info, node_map)
-            if graph_engine is not None
-            else node_map.get(from_name)
-        )
-        oct_targets = (
-            graph_engine.created_nodes_for(to_name, node_map)
-            if graph_engine is not None
-            else ([node_map[to_name]] if to_name in node_map else [])
-        )
+        if graph_engine is not None:
+            oct_pairs = graph_engine.link_node_pairs(link_info, node_map)
+        else:
+            oct_from = node_map.get(from_name)
+            oct_to = node_map.get(to_name)
+            oct_pairs = (
+                [(oct_from, oct_to)]
+                if oct_from is not None and oct_to is not None
+                else []
+            )
+        oct_targets = [target for _source, target in oct_pairs]
 
         # Inactive duplicate Material Outputs are intentionally not rebuilt.
         # Their shader branches remain available as disconnected converted
@@ -266,7 +344,7 @@ def _rebuild_links(
         ):
             continue
 
-        if oct_from is None or not oct_targets:
+        if not oct_pairs:
             report_data.add_link_failure(
                 f"Skipped link {from_name}.{from_sock_name} -> "
                 f"{to_name}.{to_sock_name}: converted node missing"
@@ -409,25 +487,29 @@ def _rebuild_links(
                 )
                 continue
 
-        # Resolve output socket on source node (with identifier fallback)
-        out_socket = resolve_output_socket(
-            from_type,
-            from_sock_name,
-            oct_from,
-            socket_identifier=getattr(link_info, "from_socket_identifier", ""),
-        )
-
-        if out_socket is None:
-            report_data.add_link_failure(
-                f"Cannot resolve output socket {from_name}.{from_sock_name}"
+        for oct_from, oct_to in oct_pairs:
+            # Resolve the output per treatment pair: mixed-intent links may
+            # originate from different duplicated nodes.
+            out_socket = resolve_output_socket(
+                from_type,
+                from_sock_name,
+                oct_from,
+                socket_identifier=getattr(
+                    link_info, "from_socket_identifier", ""
+                ),
             )
-            log.warning(
-                "Cannot resolve output socket: %s.%s on %s",
-                from_name, from_sock_name, oct_from.bl_idname,
-            )
-            continue
+            if out_socket is None:
+                report_data.add_link_failure(
+                    f"Cannot resolve output socket {from_name}.{from_sock_name}"
+                )
+                log.warning(
+                    "Cannot resolve output socket: %s.%s on %s",
+                    from_name,
+                    from_sock_name,
+                    oct_from.bl_idname,
+                )
+                continue
 
-        for oct_to in oct_targets:
             in_socket = None
             if from_type == "ShaderNodeBevel":
                 in_socket = (
@@ -948,6 +1030,7 @@ def _handle_alpha(
     analysis: TreeAnalysis,
     node_map: dict[str, bpy.types.Node],
     target_tree: bpy.types.NodeTree,
+    graph_engine: GraphEngine | None = None,
 ) -> None:
     """Preserve Image Texture Alpha edges with a dedicated alpha image.
 
@@ -968,13 +1051,37 @@ def _handle_alpha(
 
         if (from_info.bl_idname == "ShaderNodeTexImage"
                 and link_info.from_socket == "Alpha"):
-            oct_from = node_map.get(link_info.from_node)
+            if graph_engine is not None and graph_engine.intent_map is not None:
+                source_node = graph_engine._source_node(link_info.from_node)
+                if (source_node is None
+                        or Role.ALPHA not in graph_engine.intent_map.roles_for(
+                            source_node, "Alpha"
+                        )):
+                    continue
+            oct_from = (
+                graph_engine.source_node_for(link_info, node_map)
+                if graph_engine is not None
+                else node_map.get(link_info.from_node)
+            )
             oct_to = node_map.get(link_info.to_node)
             if oct_from is None or oct_to is None:
                 continue
 
             # Use a genuine Alpha output when the created node provides one.
+            is_alpha_image = getattr(oct_from, "bl_idname", "") in {
+                "OctaneAlphaImage",
+                "ShaderNodeOctAlphaImage",
+            }
             alpha_out = oct_from.outputs.get("Alpha")
+            if alpha_out is None and is_alpha_image:
+                alpha_out = _first_named_socket(
+                    oct_from.outputs,
+                    "Texture out",
+                    "OutTex",
+                    "Output",
+                )
+                if alpha_out is None and len(oct_from.outputs) == 1:
+                    alpha_out = oct_from.outputs[0]
             alpha_node = oct_from
 
             if alpha_out is None:
@@ -1315,11 +1422,7 @@ def _handle_emission_node_insertion(
                 color_default is not None
                 and any(float(channel) > 0.0 for channel in tuple(color_default)[:3])
             )
-            strength_nonzero = (
-                isinstance(strength_default, (int, float))
-                and strength_default > 0.0
-            )
-            if not (color_link or strength_link or (color_nonzero and strength_nonzero)):
+            if not (color_link or strength_link or color_nonzero):
                 continue
 
         # Find the Emission input socket on the Octane material.
@@ -1393,6 +1496,14 @@ def _handle_emission_node_insertion(
             elif isinstance(strength_default, (int, float)):
                 _set_socket_default(power_input, strength_default * 100.0)
 
+            _set_socket_default(
+                _find_input_socket_by_name(
+                    blackbody_node,
+                    ("Surface brightness", "Surface Brightness"),
+                ),
+                True,
+            )
+
             if blackbody_output is not None:
                 try:
                     target_tree.links.new(blackbody_output, emission_sock)
@@ -1422,6 +1533,18 @@ def _handle_emission_node_insertion(
             report_data.add_warning(message)
             log.warning(message)
             continue
+
+        _set_socket_default(
+            _find_input_socket_by_name(
+                emission_node,
+                ("Surface brightness", "Surface Brightness"),
+            ),
+            True,
+        )
+        try:
+            emission_node.surface_brightness = True
+        except (AttributeError, TypeError):
+            pass
 
         # Position it immediately before the material.  A linked color source
         # is used as a better horizontal anchor when available.
@@ -1832,13 +1955,17 @@ def _apply_scale_correction(
 def convert_node_group(
     group_tree: bpy.types.NodeTree,
     gamma_value: float = 2.2,
+    intent_map: ShadingIntentMap | None = None,
+    report_context_name: str = "",
 ) -> bpy.types.NodeTree | None:
     """Convert a ShaderNodeTree used by a NodeGroup."""
     if group_tree is None:
         return None
 
     tree_name = group_tree.name
-    cache_key = f"GRP_{tree_name}"
+    cache_key = (
+        f"GRP_{tree_name}_{_group_intent_signature(group_tree, intent_map)}"
+    )
 
     if _cache.has_material(cache_key):
         cached_name = _cache.get_converted_material_name(cache_key)
@@ -1860,6 +1987,7 @@ def convert_node_group(
     new_tree = None
     try:
         analysis = analyze_tree(group_tree)
+        _apply_intent_flags(analysis, intent_map, group_tree)
 
         # Always copy the source group.  Reusing a name-matched datablock can
         # destructively clear an unrelated user group or mutate a group still
@@ -1879,8 +2007,16 @@ def convert_node_group(
 
         engine = GraphEngine(
             analysis,
-            group_converter_cb=lambda t: convert_node_group(t, gamma_value),
+            group_converter_cb=lambda t: convert_node_group(
+                t,
+                gamma_value,
+                intent_map,
+                report_context_name,
+            ),
             context_name=new_tree.name,
+            intent_map=intent_map,
+            source_tree=group_tree,
+            report_context_name=report_context_name or new_tree.name,
         )
         node_map = engine.create_nodes(new_tree)
 
@@ -1927,9 +2063,16 @@ def convert_node_group(
         _handle_normal_map_fallback(analysis, node_map, new_tree, engine)
         _handle_output_displacement(analysis, node_map, new_tree, engine)
         _fix_mix_shader_links(analysis, node_map, new_tree)
-        _handle_alpha(analysis, node_map, new_tree)
+        _handle_alpha(analysis, node_map, new_tree, engine)
         _handle_emission_node_insertion(analysis, node_map, new_tree, engine)
         handle_volumetrics(analysis, node_map, new_tree)
+        apply_gamma(
+            new_tree,
+            gamma_value,
+            analysis=analysis,
+            node_map=node_map,
+            graph_engine=engine,
+        )
         _validate_converted_tree(new_tree.name, new_tree)
 
         _preserve_drivers(group_tree, analysis, node_map, new_tree)
@@ -2153,6 +2296,7 @@ def _populate_converted_material(
     obj: bpy.types.Object | None,
     clear_existing: bool = True,
     progress_callback: Callable[[float, str], None] | None = None,
+    intent_map: ShadingIntentMap | None = None,
 ) -> list[bpy.types.Node]:
     """Build an Octane graph and return every node owned by that graph."""
     if clear_existing:
@@ -2161,9 +2305,17 @@ def _populate_converted_material(
 
     engine = GraphEngine(
         analysis,
-        group_converter_cb=lambda tree: convert_node_group(tree, gamma_value),
+        group_converter_cb=lambda tree: convert_node_group(
+            tree,
+            gamma_value,
+            intent_map,
+            original.name,
+        ),
         context_name=converted.name,
         reuse_output_nodes=clear_existing,
+        intent_map=intent_map,
+        source_tree=original.node_tree,
+        report_context_name=original.name,
     )
 
     def _node_progress(completed: int, total: int, label: str) -> None:
@@ -2209,7 +2361,7 @@ def _populate_converted_material(
         analysis, node_map, converted.node_tree, engine
     )
     _fix_mix_shader_links(analysis, node_map, converted.node_tree)
-    _handle_alpha(analysis, node_map, converted.node_tree)
+    _handle_alpha(analysis, node_map, converted.node_tree, engine)
     _handle_emission_post(analysis, node_map, converted.node_tree)
     _handle_emission_node_insertion(
         analysis, node_map, converted.node_tree, engine
@@ -2217,7 +2369,13 @@ def _populate_converted_material(
     if progress_callback is not None:
         progress_callback(0.90, "Finalizing material graph")
     handle_volumetrics(analysis, node_map, converted.node_tree)
-    apply_gamma(converted, gamma_value)
+    apply_gamma(
+        converted,
+        gamma_value,
+        analysis=analysis,
+        node_map=node_map,
+        graph_engine=engine,
+    )
     _apply_scale_correction(obj, node_map, analysis)
     _preserve_drivers(original.node_tree, analysis, node_map, converted.node_tree)
     _validate_converted_tree(converted.name, converted.node_tree)
@@ -2287,6 +2445,10 @@ def convert_material(
         if progress_callback is not None:
             progress_callback(0.02, f"Analyzing {mat_name}")
         analysis = analyze_tree(mat.node_tree)
+        intent_map = trace_shading_intent(
+            _selected_material_output(mat.node_tree)
+        )
+        _apply_intent_flags(analysis, intent_map, mat.node_tree)
         if smart_conversion:
             new_mat = mat
             _route_original_outputs_to_cycles(original_nodes)
@@ -2298,6 +2460,7 @@ def convert_material(
                 obj,
                 clear_existing=False,
                 progress_callback=progress_callback,
+                intent_map=intent_map,
             )
             style_smart_graphs(
                 mat.node_tree,
@@ -2318,6 +2481,7 @@ def convert_material(
                 obj,
                 clear_existing=True,
                 progress_callback=progress_callback,
+                intent_map=intent_map,
             )
             style_converted_graph(
                 new_mat.node_tree,

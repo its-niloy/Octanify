@@ -199,6 +199,7 @@ def _draw_last_report(
             report_data.links_created,
             report_data.links_failed,
             report_data.approximations,
+            report_data.notices,
             report_data.warnings,
         )
     )
@@ -243,6 +244,17 @@ def _draw_last_report(
             layout.label(
                 text=f"...and {len(report_data.approximations) - 5} more"
             )
+
+    if report_data.notices:
+        layout.separator()
+        layout.label(
+            text=f"Notices ({len(report_data.notices)})",
+            icon="INFO",
+        )
+        for message in report_data.notices[:5]:
+            layout.label(text=message, icon="DOT")
+        if len(report_data.notices) > 5:
+            layout.label(text=f"...and {len(report_data.notices) - 5} more")
 
     if report_data.warnings:
         layout.separator()

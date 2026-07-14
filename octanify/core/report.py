@@ -15,6 +15,7 @@ class ConversionReport:
         self.links_created: int = 0
         self.links_failed: int = 0
         self.approximations: list[str] = []
+        self.notices: list[str] = []
         self.warnings: list[str] = []
         
     def clear(self) -> None:
@@ -25,6 +26,7 @@ class ConversionReport:
         self.links_created = 0
         self.links_failed = 0
         self.approximations.clear()
+        self.notices.clear()
         self.warnings.clear()
         
     def add_warning(self, message: str) -> None:
@@ -36,6 +38,11 @@ class ConversionReport:
         """Record a conversion that is usable but not perfectly equivalent."""
         if message not in self.approximations:
             self.approximations.append(message)
+
+    def add_notice(self, message: str) -> None:
+        """Record an informational conversion action handled automatically."""
+        if message not in self.notices:
+            self.notices.append(message)
 
     def add_link_failure(self, message: str) -> None:
         """Record a failed link reconstruction."""

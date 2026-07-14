@@ -7,8 +7,11 @@ normal maps, metallic, displacement).
 
 from __future__ import annotations
 
+import os
+
 import bpy
 
+from .shading_intent import Role, TextureTreatment
 from ..utils.logger import get_logger
 
 log = get_logger()
@@ -33,6 +36,116 @@ _NON_COLOR_INPUTS: set[str] = {
     "Coating roughness", "Coating roughness float",
     "Sheen roughness", "Sheen roughness float",
 }
+
+_LINEAR_COLORSPACES = {
+    "Non-Color",
+    "Linear",
+    "Raw",
+    "Utility - Linear - sRGB",
+    "Utility - Raw",
+    "Linear ACES",
+    "Utility - Linear - Rec.709",
+}
+
+
+def _is_linear_colorspace(name: str) -> bool:
+    return name in _LINEAR_COLORSPACES or name.lower().startswith("linear")
+
+
+def _is_srgb_colorspace(name: str) -> bool:
+    return not _is_linear_colorspace(name) and "srgb" in name.lower().replace(" ", "")
+
+
+def _set_node_gamma(node: bpy.types.Node, value: float) -> bool:
+    """Set an Octane image node's legacy gamma through either API shape."""
+    gamma_set = False
+    if hasattr(node, "gamma"):
+        try:
+            node.gamma = value
+            gamma_set = True
+        except (AttributeError, TypeError):
+            pass
+    for name in ("Legacy gamma", "Gamma", "Power"):
+        inp = node.inputs.get(name)
+        if inp is None or not hasattr(inp, "default_value"):
+            continue
+        try:
+            inp.default_value = value
+            gamma_set = True
+            break
+        except (TypeError, AttributeError):
+            continue
+    return gamma_set
+
+
+def _image_filename(info) -> str:
+    filepath = info.properties.get("filepath", "")
+    filename = os.path.basename(filepath.replace("\\", "/")) if filepath else ""
+    return filename or info.properties.get("image_name", info.name)
+
+
+def _role_destination(roles: set[Role], treatment: TextureTreatment) -> str:
+    if treatment == TextureTreatment.COLOR:
+        destinations = (
+            (Role.ALBEDO, "Base Color"),
+            (Role.EMISSION, "Emission"),
+            (Role.SUBSURFACE, "Subsurface"),
+            (Role.COAT, "Coat"),
+            (Role.SHEEN, "Sheen"),
+            (Role.TRANSMISSION, "Transmission"),
+        )
+        return next(
+            (label for role, label in destinations if role in roles),
+            "color",
+        )
+    destinations = (
+        (Role.ROUGHNESS, "Roughness"),
+        (Role.METALLIC, "Metallic"),
+        (Role.NORMAL, "Normal"),
+        (Role.BUMP, "Bump"),
+        (Role.ALPHA, "Alpha"),
+        (Role.DISPLACEMENT, "Displacement"),
+        (Role.SUBSURFACE, "Subsurface"),
+        (Role.COAT, "Coat"),
+        (Role.SHEEN, "Sheen"),
+        (Role.TRANSMISSION, "Transmission"),
+    )
+    return next((label for role, label in destinations if role in roles), "data")
+
+
+def _report_colorspace_mismatch(
+    material_name: str,
+    info,
+    roles: set[Role],
+    treatments: set[TextureTreatment],
+) -> None:
+    """Surface destination-overrides-source colorspace mismatches."""
+    colorspace = info.properties.get("colorspace", "sRGB")
+    filename = _image_filename(info)
+    from .report import report_data
+
+    if (TextureTreatment.COLOR in treatments
+            and roles & {Role.ALBEDO, Role.EMISSION}
+            and _is_linear_colorspace(colorspace)):
+        destination = _role_destination(roles, TextureTreatment.COLOR)
+        report_data.add_warning(
+            f"[{material_name}] '{filename}' feeds {destination} but is set to "
+            f"{colorspace} — treating as sRGB, verify source asset."
+        )
+    if (TextureTreatment.DATA in treatments
+            and roles & {
+                Role.ROUGHNESS,
+                Role.METALLIC,
+                Role.NORMAL,
+                Role.BUMP,
+                Role.ALPHA,
+            }
+            and _is_srgb_colorspace(colorspace)):
+        destination = _role_destination(roles, TextureTreatment.DATA)
+        report_data.add_warning(
+            f"[{material_name}] '{filename}' feeds {destination} but is set to "
+            f"{colorspace} — treating as linear/data, verify source asset."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -99,56 +212,92 @@ def _collect_image_nodes(
 def apply_gamma(
     material: bpy.types.Material,
     gamma_value: float,
+    *,
+    analysis=None,
+    node_map: dict[str, bpy.types.Node] | None = None,
+    graph_engine=None,
 ) -> int:
     """
     Apply gamma correction to albedo image texture nodes in the material.
 
     Returns the number of nodes affected.
     """
-    if material is None or material.node_tree is None:
+    if material is None:
         return 0
 
-    tree = material.node_tree
-    image_nodes = _find_albedo_image_nodes(tree)
+    tree = getattr(material, "node_tree", material)
+    if tree is None or not hasattr(tree, "nodes"):
+        return 0
     count = 0
 
+    # Conversion-time path: the destination intent map is authoritative.  It
+    # also exposes both nodes created for a color/data conflict.
+    if graph_engine is not None and node_map is not None and analysis is not None:
+        material_name = (
+            getattr(graph_engine, "report_context_name", "")
+            or getattr(material, "name", tree.name)
+        )
+        for node_name, info in analysis.nodes.items():
+            if info.bl_idname != "ShaderNodeTexImage":
+                continue
+            treatments = graph_engine.intent_treatments_for(node_name)
+            if not treatments:
+                continue
+            roles = graph_engine.intent_roles_for(node_name)
+            _report_colorspace_mismatch(
+                material_name, info, roles, treatments
+            )
+            for node, treatment in graph_engine.image_variants_for(
+                node_name, node_map
+            ):
+                if treatment == TextureTreatment.COLOR:
+                    value = gamma_value
+                elif treatment == TextureTreatment.DATA:
+                    value = 1.0
+                else:
+                    continue
+                if _set_node_gamma(node, value):
+                    count += 1
+                    log.debug(
+                        "Intent gamma %.2f applied to '%s' (%s)",
+                        value,
+                        node.name,
+                        treatment.value,
+                    )
+        return count
+
+    # Update-time path for materials converted by the intent engine.  Tags
+    # persist on Octane image nodes, so changing the user's albedo gamma never
+    # accidentally applies it to a linear/data variant.
+    tagged = False
+    for node in tree.nodes:
+        try:
+            treatment_name = node.get("octanify_intent_treatment")
+        except (AttributeError, TypeError):
+            treatment_name = None
+        if treatment_name not in {
+            TextureTreatment.COLOR.value,
+            TextureTreatment.DATA.value,
+        }:
+            continue
+        tagged = True
+        value = gamma_value if treatment_name == "color" else 1.0
+        if _set_node_gamma(node, value):
+            count += 1
+    if tagged:
+        return count
+
+    # Legacy fallback for materials converted before role tags existed.
+    image_nodes = _find_albedo_image_nodes(tree)
     for node in image_nodes:
-        # Check if the image is already non-color (shouldn't get gamma)
         img = getattr(node, "image", None)
         if img is not None:
             cs = getattr(img, "colorspace_settings", None)
-            if cs is not None:
-                cs_name = cs.name
-                if cs_name in ("Non-Color", "Linear", "Raw"):
-                    continue  # Skip non-color data
-
-        # Try to set gamma on the node
-        gamma_set = False
-
-        # Method 1: Direct gamma attribute
-        if hasattr(node, "gamma"):
-            try:
-                node.gamma = gamma_value
-                gamma_set = True
-            except (AttributeError, TypeError):
-                pass
-
-        # Method 2: Gamma input socket
-        if not gamma_set:
-            for name in ("Gamma", "Power", "Legacy gamma"):
-                inp = node.inputs.get(name)
-                if inp is not None and hasattr(inp, "default_value"):
-                    try:
-                        inp.default_value = gamma_value
-                        gamma_set = True
-                        break
-                    except (TypeError, AttributeError):
-                        continue
-
-        if gamma_set:
+            if cs is not None and _is_linear_colorspace(cs.name):
+                continue
+        if _set_node_gamma(node, gamma_value):
             count += 1
             log.debug("Gamma %.2f applied to '%s'", gamma_value, node.name)
-
     return count
 
 
