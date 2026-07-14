@@ -15,6 +15,7 @@ import time
 import bpy
 
 from ..core.conversion_engine import (
+    collect_material_work_items,
     convert_material,
     convert_objects_materials,
     reset_cache,
@@ -106,14 +107,11 @@ def _objects_for_conversion(context: bpy.types.Context) -> list[bpy.types.Object
     return list(context.scene.objects)
 
 
-def _material_work_items(objects) -> list[tuple[bpy.types.Object, object]]:
-    """Collect material slots in deterministic object/slot order."""
-    return [
-        (obj, slot)
-        for obj in objects
-        for slot in getattr(obj, "material_slots", ())
-        if slot.material is not None
-    ]
+def _material_work_items(
+    objects,
+) -> list[tuple[bpy.types.Object, bpy.types.Material, object | None]]:
+    """Collect slot and Geometry Nodes material work in stable order."""
+    return collect_material_work_items(objects)
 
 
 def _rna_identity(value) -> int:
@@ -124,15 +122,18 @@ def _rna_identity(value) -> int:
 
 
 def _materials_for_objects(objects) -> list[bpy.types.Material]:
-    """Return unique materials used by an object collection."""
+    """Return unique slot materials used by an object collection."""
     materials = []
     seen: set[int] = set()
-    for _obj, slot in _material_work_items(objects):
-        material = slot.material
-        identity = _rna_identity(material)
-        if identity not in seen:
-            materials.append(material)
-            seen.add(identity)
+    for obj in objects:
+        for slot in getattr(obj, "material_slots", ()):
+            material = getattr(slot, "material", None)
+            if material is None:
+                continue
+            identity = _rna_identity(material)
+            if identity not in seen:
+                materials.append(material)
+                seen.add(identity)
     return materials
 
 
@@ -393,8 +394,7 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
             self._report_summary()
             return {"FINISHED"}
 
-        obj, slot = self._work_items[self._work_index]
-        material = slot.material
+        obj, material, slot = self._work_items[self._work_index]
         material_index = self._work_index
         label = getattr(material, "name", getattr(obj, "name", "Material"))
 
@@ -418,7 +418,7 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
                     auto_arrange=True,
                     progress_callback=_material_progress,
                 )
-                if converted is not None:
+                if converted is not None and slot is not None:
                     slot.material = converted
         except Exception as exc:
             log.error("Conversion failed: %s", exc, exc_info=True)

@@ -34,6 +34,7 @@ from .node_registry import (
     is_standard_surface_node,
 )
 from .gamma_system import apply_gamma
+from .geonodes_scan import collect_geometry_node_materials
 from .shading_intent import Role, ShadingIntentMap, trace_shading_intent
 from .layout_engine import style_converted_graph, style_smart_graphs
 from .volumetric_handler import handle_volumetrics
@@ -2419,13 +2420,6 @@ def convert_material(
 
     mat_name = mat.name
 
-    # Prevent converting an already converted or natively-authored Octane
-    # material.  Name suffixes alone are not reliable because Blender appends
-    # .001 and users may legitimately use `_OCTANE` in a Cycles material name.
-    if _is_octane_material(mat):
-        log.info("Material '%s' is already an Octane material, skipping", mat_name)
-        return None
-
     # Check cache
     if _cache.has_material(mat_name):
         cached_name = _cache.get_converted_material_name(mat_name)
@@ -2434,6 +2428,13 @@ def convert_material(
             log.info("Material '%s' already converted as '%s', reusing", mat_name, cached_name)
             return cached_material
         _cache.unregister_material(mat_name)
+
+    # Prevent converting an already converted or natively-authored Octane
+    # material.  Name suffixes alone are not reliable because Blender appends
+    # .001 and users may legitimately use `_OCTANE` in a Cycles material name.
+    if _is_octane_material(mat):
+        log.info("Material '%s' is already an Octane material, skipping", mat_name)
+        return None
 
     log.info("Converting material: %s", mat_name)
 
@@ -2539,6 +2540,48 @@ def convert_material(
 # Public API — batch conversion
 # ---------------------------------------------------------------------------
 
+def collect_material_work_items(
+    objects: Iterable[bpy.types.Object],
+) -> list[tuple[bpy.types.Object, bpy.types.Material, object | None]]:
+    """Collect slot and Geometry Nodes materials in deterministic order.
+
+    The optional third tuple item is the assignable material slot. Geometry
+    Nodes references deliberately use ``None`` because this phase discovers
+    and converts materials without rewriting Set Material nodes.
+    """
+    work_items: list[
+        tuple[bpy.types.Object, bpy.types.Material, object | None]
+    ] = []
+    normal_slot_ids: set[int] = set()
+    geometry_nodes_ids: set[int] = set()
+
+    for obj in objects:
+        if obj is None:
+            continue
+        for slot in getattr(obj, "material_slots", ()):
+            material = getattr(slot, "material", None)
+            if material is None:
+                continue
+            work_items.append((obj, material, slot))
+            normal_slot_ids.add(_rna_identity(material))
+
+        for material in collect_geometry_node_materials(obj):
+            work_items.append((obj, material, None))
+            geometry_nodes_ids.add(_rna_identity(material))
+
+    if geometry_nodes_ids:
+        message = (
+            f"[Geometry Nodes] Found {len(geometry_nodes_ids)} unique "
+            f"material(s) via Geometry Nodes vs {len(normal_slot_ids)} "
+            f"via normal slots."
+        )
+        if message not in report_data.notices:
+            report_data.add_notice(message)
+            log.info(message)
+
+    return work_items
+
+
 def convert_object_materials(
     obj: bpy.types.Object,
     gamma_value: float = 2.2,
@@ -2565,17 +2608,11 @@ def convert_objects_materials(
     progress_callback: Callable[[int, int, str], None] | None = None,
     reset_conversion_cache: bool = True,
 ) -> list[bpy.types.Material]:
-    """Convert material slots across a deterministic object collection."""
+    """Convert discovered materials across a deterministic object collection."""
     if reset_conversion_cache:
         reset_cache()
 
-    work_items = []
-    for obj in objects:
-        if obj is None or not hasattr(obj, "material_slots"):
-            continue
-        for slot in obj.material_slots:
-            if slot.material is not None:
-                work_items.append((obj, slot))
+    work_items = collect_material_work_items(objects)
 
     converted: list[bpy.types.Material] = []
     converted_ids: set[int] = set()
@@ -2583,8 +2620,7 @@ def convert_objects_materials(
     if progress_callback is not None:
         progress_callback(0, 1000, "Preparing materials")
 
-    for index, (obj, slot) in enumerate(work_items, start=1):
-        mat = slot.material
+    for index, (obj, mat, slot) in enumerate(work_items, start=1):
         label = getattr(mat, "name", getattr(obj, "name", "Material"))
 
         def _material_progress(fraction: float, detail: str) -> None:
@@ -2603,7 +2639,8 @@ def convert_objects_materials(
             progress_callback=_material_progress,
         )
         if new_mat is not None:
-            slot.material = new_mat
+            if slot is not None:
+                slot.material = new_mat
             identity = _rna_identity(new_mat)
             if identity not in converted_ids:
                 converted.append(new_mat)
@@ -2621,7 +2658,7 @@ def convert_scene_materials(
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[bpy.types.Material]:
     """Convert all Cycles materials across all objects in the scene."""
-    objects = [obj for obj in bpy.context.scene.objects if hasattr(obj, "material_slots")]
+    objects = list(bpy.context.scene.objects)
     return convert_objects_materials(
         objects,
         gamma_value=gamma_value,

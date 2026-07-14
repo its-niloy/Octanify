@@ -57,9 +57,12 @@ from octanify.core.conversion_engine import (
     _handle_principled_material_inputs,
     _rebuild_links,
     _route_original_outputs_to_cycles,
+    collect_material_work_items,
     convert_material,
+    convert_objects_materials,
     reset_cache,
 )
+from octanify.core.geonodes_scan import collect_geometry_node_materials
 from octanify.core.node_registry import (
     NODE_TYPE_MAP,
     get_contextual_node_candidates,
@@ -844,6 +847,321 @@ class ShadingIntentTests(unittest.TestCase):
         self.assertNotIn((image, "Color"), intent)
 
 
+class GeometryNodesMaterialScanTests(unittest.TestCase):
+    def setUp(self) -> None:
+        report_data.clear()
+        reset_cache()
+
+    @staticmethod
+    def _material(name: str):
+        material = bpy.types.Material()
+        material.name = name
+        return material
+
+    @staticmethod
+    def _set_material(name: str, material=None):
+        return _attach_sockets(
+            _Node(
+                name,
+                "GeometryNodeSetMaterial",
+                inputs=[
+                    _Socket("Selection", True),
+                    _Socket("Material", material),
+                ],
+                outputs=[_Socket("Geometry")],
+            )
+        )
+
+    @staticmethod
+    def _object(node_tree=None, *, material_slots=()):
+        modifiers = (
+            [SimpleNamespace(type="NODES", node_group=node_tree)]
+            if node_tree is not None
+            else []
+        )
+        return SimpleNamespace(
+            name="Geometry Object",
+            modifiers=modifiers,
+            material_slots=list(material_slots),
+        )
+
+    def test_direct_set_material_is_stable_and_deduplicated(self) -> None:
+        material_a = self._material("Material A")
+        material_b = self._material("Material B")
+        tree = SimpleNamespace(
+            name="Geometry",
+            nodes=_Nodes([
+                self._set_material("First", material_b),
+                self._set_material("Duplicate", material_b),
+                self._set_material("Last", material_a),
+            ]),
+        )
+
+        materials = collect_geometry_node_materials(self._object(tree))
+
+        self.assertEqual(materials, [material_b, material_a])
+
+    def test_switch_collects_every_material_branch(self) -> None:
+        material_a = self._material("Material A")
+        material_b = self._material("Material B")
+        false_socket = _Socket("False", material_a)
+        false_socket.bl_idname = "NodeSocketMaterial"
+        true_socket = _Socket("True", material_b)
+        true_socket.bl_idname = "NodeSocketMaterial"
+        switch = _attach_sockets(
+            _Node(
+                "Material Switch",
+                "GeometryNodeSwitch",
+                inputs=[
+                    _Socket("Switch", False),
+                    false_socket,
+                    true_socket,
+                ],
+                outputs=[_Socket("Output")],
+            )
+        )
+        set_material = self._set_material("Set Material")
+        links = _Links()
+        links.new(
+            switch.outputs.get("Output"),
+            set_material.inputs.get("Material"),
+        )
+        tree = SimpleNamespace(
+            name="Switch Geometry",
+            nodes=_Nodes([switch, set_material]),
+            links=links,
+        )
+
+        materials = collect_geometry_node_materials(self._object(tree))
+
+        self.assertEqual(materials, [material_a, material_b])
+
+    def test_index_switch_collects_every_material_branch(self) -> None:
+        material_a = self._material("Material A")
+        material_b = self._material("Material B")
+        first_socket = _Socket("0", material_a)
+        first_socket.bl_idname = "NodeSocketMaterial"
+        second_socket = _Socket("1", material_b)
+        second_socket.bl_idname = "NodeSocketMaterial"
+        switch = _attach_sockets(
+            _Node(
+                "Material Index Switch",
+                "GeometryNodeIndexSwitch",
+                inputs=[
+                    _Socket("Index", 0),
+                    first_socket,
+                    second_socket,
+                ],
+                outputs=[_Socket("Output")],
+            )
+        )
+        set_material = self._set_material("Set Material")
+        links = _Links()
+        links.new(
+            switch.outputs.get("Output"),
+            set_material.inputs.get("Material"),
+        )
+        tree = SimpleNamespace(
+            name="Index Switch Geometry",
+            nodes=_Nodes([switch, set_material]),
+            links=links,
+        )
+
+        materials = collect_geometry_node_materials(self._object(tree))
+
+        self.assertEqual(materials, [material_a, material_b])
+
+    def test_nested_group_resolves_material_across_group_input(self) -> None:
+        material = self._material("Nested Material")
+        group_input = _attach_sockets(
+            _Node(
+                "Group Input",
+                "NodeGroupInput",
+                outputs=[_Socket("Material")],
+            )
+        )
+        set_material = self._set_material("Nested Set Material")
+        inner_links = _Links()
+        inner_links.new(
+            group_input.outputs.get("Material"),
+            set_material.inputs.get("Material"),
+        )
+        inner_tree = SimpleNamespace(
+            name="Inner Geometry",
+            nodes=_Nodes([group_input, set_material]),
+            links=inner_links,
+        )
+        inner_group = _attach_sockets(
+            _Node(
+                "Inner Group",
+                "GeometryNodeGroup",
+                inputs=[_Socket("Material", material)],
+            )
+        )
+        inner_group.node_tree = inner_tree
+        middle_tree = SimpleNamespace(
+            name="Middle Geometry",
+            nodes=_Nodes([inner_group]),
+            links=_Links(),
+        )
+        outer_group = _attach_sockets(
+            _Node("Outer Group", "GeometryNodeGroup")
+        )
+        outer_group.node_tree = middle_tree
+        root_tree = SimpleNamespace(
+            name="Root Geometry",
+            nodes=_Nodes([outer_group]),
+            links=_Links(),
+        )
+
+        materials = collect_geometry_node_materials(
+            self._object(root_tree)
+        )
+
+        self.assertEqual(materials, [material])
+
+    def test_no_geometry_nodes_or_set_material_is_empty(self) -> None:
+        self.assertEqual(
+            collect_geometry_node_materials(self._object()),
+            [],
+        )
+        empty_tree = SimpleNamespace(
+            name="Empty Geometry",
+            nodes=_Nodes([_Node("Join", "GeometryNodeJoinGeometry")]),
+            links=_Links(),
+        )
+        self.assertEqual(
+            collect_geometry_node_materials(self._object(empty_tree)),
+            [],
+        )
+
+    def test_recursive_group_cycle_logs_once_and_stops(self) -> None:
+        recursive_group = _attach_sockets(
+            _Node("Recursive Group", "GeometryNodeGroup")
+        )
+        tree = SimpleNamespace(
+            name="Recursive Geometry",
+            nodes=_Nodes([recursive_group]),
+            links=_Links(),
+        )
+        recursive_group.node_tree = tree
+
+        with patch(
+            "octanify.core.geonodes_scan.log.warning"
+        ) as warning:
+            materials = collect_geometry_node_materials(self._object(tree))
+
+        self.assertEqual(materials, [])
+        warning.assert_called_once()
+        self.assertIn("recursive group", warning.call_args.args[0])
+
+    def test_depth_cap_logs_once_and_stops_deep_branch(self) -> None:
+        material = self._material("Deep Material")
+        leaf = SimpleNamespace(
+            name="Leaf Geometry",
+            nodes=_Nodes([self._set_material("Deep Set", material)]),
+            links=_Links(),
+        )
+        middle_group = _attach_sockets(
+            _Node("Middle Group", "GeometryNodeGroup")
+        )
+        middle_group.node_tree = leaf
+        middle = SimpleNamespace(
+            name="Middle Geometry",
+            nodes=_Nodes([middle_group]),
+            links=_Links(),
+        )
+        root_group = _attach_sockets(
+            _Node("Root Group", "GeometryNodeGroup")
+        )
+        root_group.node_tree = middle
+        root = SimpleNamespace(
+            name="Root Geometry",
+            nodes=_Nodes([root_group]),
+            links=_Links(),
+        )
+
+        with patch(
+            "octanify.core.geonodes_scan.log.warning"
+        ) as warning:
+            materials = collect_geometry_node_materials(
+                self._object(root), max_depth=1
+            )
+
+        self.assertEqual(materials, [])
+        warning.assert_called_once()
+        self.assertIn("exceeded %d nodes", warning.call_args.args[0])
+
+    def test_slot_and_geometry_reference_convert_once_via_cache(self) -> None:
+        class _Material(dict):
+            def __init__(self) -> None:
+                super().__init__()
+                self.name = "Shared Material"
+                self.node_tree = SimpleNamespace(nodes=[])
+
+        material = _Material()
+        slot = SimpleNamespace(material=material)
+        obj = self._object(material_slots=[slot])
+        bpy.data = SimpleNamespace(
+            materials=SimpleNamespace(
+                get=lambda name: material if name == material.name else None
+            )
+        )
+
+        with patch(
+            "octanify.core.conversion_engine.collect_geometry_node_materials",
+            return_value=[material],
+        ), patch(
+            "octanify.core.conversion_engine.analyze_tree",
+            return_value=SimpleNamespace(nodes={}, links=[], has_emission=False),
+        ), patch(
+            "octanify.core.conversion_engine._populate_converted_material",
+            return_value=[],
+        ) as populate, patch(
+            "octanify.core.conversion_engine.style_smart_graphs"
+        ):
+            converted = convert_objects_materials([obj])
+
+        self.assertEqual(converted, [material])
+        self.assertEqual(report_data.materials_converted, 1)
+        populate.assert_called_once()
+        self.assertTrue(
+            any(
+                "1 unique material(s) via Geometry Nodes vs 1 via normal slots"
+                in notice
+                for notice in report_data.notices
+            )
+        )
+
+    def test_report_notice_counts_unique_materials_per_source(self) -> None:
+        material_a = self._material("Material A")
+        material_b = self._material("Material B")
+        first = self._object(
+            material_slots=[
+                SimpleNamespace(material=material_a),
+                SimpleNamespace(material=material_a),
+            ]
+        )
+        second = self._object(
+            material_slots=[SimpleNamespace(material=material_a)]
+        )
+
+        with patch(
+            "octanify.core.conversion_engine.collect_geometry_node_materials",
+            side_effect=[[material_a, material_b], [material_a, material_b]],
+        ):
+            work_items = collect_material_work_items([first, second])
+
+        self.assertEqual(len(work_items), 7)
+        self.assertTrue(
+            any(
+                "2 unique material(s) via Geometry Nodes vs 1 via normal slots"
+                in notice
+                for notice in report_data.notices
+            )
+        )
+
+
 class OperatorUtilityTests(unittest.TestCase):
     def test_texture_filename_inference_still_has_regex_runtime(self) -> None:
         self.assertEqual(
@@ -953,7 +1271,7 @@ class OperatorUtilityTests(unittest.TestCase):
         operator._batch_mode = "ACTIVE"
         operator._gamma = 2.2
         operator._objects = [obj]
-        operator._work_items = [(obj, slot)]
+        operator._work_items = [(obj, material, slot)]
         operator._work_index = 0
         operator._timer = None
 
