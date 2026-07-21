@@ -82,7 +82,7 @@ class TreeAnalysis:
 #
 # IMPORTANT: Only nodes that have NO Octane equivalent belong here.
 # Nodes like Math, Clamp, Invert, HueSat, BrightContrast, Gamma,
-# and RGBCurves have valid Octane mappings and MUST be analyzed normally.
+# and RGB Curves have valid Octane mappings and MUST be analyzed normally.
 #
 # BUG 1 FIX: Separate*/Combine* were removed from here because making
 # them transparent caused _trace_transparent_source to return a single

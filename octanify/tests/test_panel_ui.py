@@ -96,6 +96,8 @@ def _scene(**overrides):
         "octanify_batch_mode": "ACTIVE",
         "octanify_base_material": "STANDARD_SURFACE",
         "octanify_albedo_gamma": 2.2,
+        "octanify_auto_arrange": True,
+        "octanify_color_nodes": True,
         "octanify_progress": 0,
         "octanify_progress_label": "Ready",
         "octanify_progress_active": False,
@@ -130,6 +132,22 @@ class PanelHierarchyTests(unittest.TestCase):
 
         self.assertLess(operator_index, scope_index)
         self.assertLess(scope_index, material_index)
+        self.assertTrue(
+            any(
+                event[0] == "prop"
+                and event[1] == "octanify_auto_arrange"
+                and event[2].get("toggle")
+                for event in layout.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event[0] == "prop"
+                and event[1] == "octanify_color_nodes"
+                and event[2].get("toggle")
+                for event in layout.events
+            )
+        )
 
         target_event = layout.events[scope_index]
         action_event = layout.events[operator_index]
@@ -171,6 +189,7 @@ class PanelHierarchyTests(unittest.TestCase):
             [event[1] for event in tools_layout.events if event[0] == "operator"],
             [
                 "octanify.preview_node_viewport",
+                "octanify.arrange_node_tree",
                 "octanify.create_basic_material",
                 "octanify.auto_connect_textures",
                 "octanify.delete_cycles_nodes",

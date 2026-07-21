@@ -1958,14 +1958,20 @@ def convert_node_group(
     gamma_value: float = 2.2,
     intent_map: ShadingIntentMap | None = None,
     report_context_name: str = "",
+    auto_arrange: bool = True,
+    # Kept after the established positional parameters for API compatibility.
+    color_nodes: bool = True,
 ) -> bpy.types.NodeTree | None:
     """Convert a ShaderNodeTree used by a NodeGroup."""
     if group_tree is None:
         return None
 
     tree_name = group_tree.name
+    layout_signature = "arranged" if auto_arrange else "source_layout"
+    color_signature = "colored" if color_nodes else "default_color"
     cache_key = (
-        f"GRP_{tree_name}_{_group_intent_signature(group_tree, intent_map)}"
+        f"GRP_{tree_name}_{_group_intent_signature(group_tree, intent_map)}_"
+        f"{layout_signature}_{color_signature}"
     )
 
     if _cache.has_material(cache_key):
@@ -2013,6 +2019,8 @@ def convert_node_group(
                 gamma_value,
                 intent_map,
                 report_context_name,
+                auto_arrange,
+                color_nodes,
             ),
             context_name=new_tree.name,
             intent_map=intent_map,
@@ -2077,6 +2085,13 @@ def convert_node_group(
         _validate_converted_tree(new_tree.name, new_tree)
 
         _preserve_drivers(group_tree, analysis, node_map, new_tree)
+
+        style_converted_graph(
+            new_tree,
+            list(new_tree.nodes),
+            auto_arrange=auto_arrange,
+            colorize=color_nodes,
+        )
 
         _cache.register_material(cache_key, new_tree.name)
         return new_tree
@@ -2298,6 +2313,8 @@ def _populate_converted_material(
     clear_existing: bool = True,
     progress_callback: Callable[[float, str], None] | None = None,
     intent_map: ShadingIntentMap | None = None,
+    auto_arrange: bool = True,
+    color_nodes: bool = True,
 ) -> list[bpy.types.Node]:
     """Build an Octane graph and return every node owned by that graph."""
     if clear_existing:
@@ -2311,6 +2328,8 @@ def _populate_converted_material(
             gamma_value,
             intent_map,
             original.name,
+            auto_arrange,
+            color_nodes,
         ),
         context_name=converted.name,
         reuse_output_nodes=clear_existing,
@@ -2404,6 +2423,7 @@ def convert_material(
     smart_conversion: bool = True,
     auto_arrange: bool = True,
     progress_callback: Callable[[float, str], None] | None = None,
+    color_nodes: bool = True,
 ) -> bpy.types.Material | None:
     """
     Convert a single Cycles material to Octane.
@@ -2462,12 +2482,15 @@ def convert_material(
                 clear_existing=False,
                 progress_callback=progress_callback,
                 intent_map=intent_map,
+                auto_arrange=auto_arrange,
+                color_nodes=color_nodes,
             )
             style_smart_graphs(
                 mat.node_tree,
                 original_nodes,
                 converted_nodes,
                 auto_arrange=auto_arrange,
+                colorize=color_nodes,
             )
             _restore_active_output_state(original_visual_state)
         else:
@@ -2483,11 +2506,14 @@ def convert_material(
                 clear_existing=True,
                 progress_callback=progress_callback,
                 intent_map=intent_map,
+                auto_arrange=auto_arrange,
+                color_nodes=color_nodes,
             )
             style_converted_graph(
                 new_mat.node_tree,
                 converted_nodes,
                 auto_arrange=auto_arrange,
+                colorize=color_nodes,
             )
 
         try:
@@ -2588,6 +2614,7 @@ def convert_object_materials(
     smart_conversion: bool = True,
     auto_arrange: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    color_nodes: bool = True,
 ) -> list[bpy.types.Material]:
     """Convert all Cycles materials on a single object."""
     return convert_objects_materials(
@@ -2595,6 +2622,7 @@ def convert_object_materials(
         gamma_value=gamma_value,
         smart_conversion=smart_conversion,
         auto_arrange=auto_arrange,
+        color_nodes=color_nodes,
         progress_callback=progress_callback,
         reset_conversion_cache=False,
     )
@@ -2607,6 +2635,7 @@ def convert_objects_materials(
     auto_arrange: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
     reset_conversion_cache: bool = True,
+    color_nodes: bool = True,
 ) -> list[bpy.types.Material]:
     """Convert discovered materials across a deterministic object collection."""
     if reset_conversion_cache:
@@ -2636,6 +2665,7 @@ def convert_objects_materials(
             obj=obj,
             smart_conversion=smart_conversion,
             auto_arrange=auto_arrange,
+            color_nodes=color_nodes,
             progress_callback=_material_progress,
         )
         if new_mat is not None:
@@ -2656,6 +2686,7 @@ def convert_scene_materials(
     smart_conversion: bool = True,
     auto_arrange: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    color_nodes: bool = True,
 ) -> list[bpy.types.Material]:
     """Convert all Cycles materials across all objects in the scene."""
     objects = list(bpy.context.scene.objects)
@@ -2664,6 +2695,7 @@ def convert_scene_materials(
         gamma_value=gamma_value,
         smart_conversion=smart_conversion,
         auto_arrange=auto_arrange,
+        color_nodes=color_nodes,
         progress_callback=progress_callback,
         reset_conversion_cache=True,
     )

@@ -212,7 +212,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "ShaderNodeOctGammaCorrectionTex",
         "OctaneGammaCorrection",
     ],
-    "ShaderNodeRGBCurves": [
+    "ShaderNodeRGBCurve": [
         "OctaneColorCorrection",
         "ShaderNodeOctColorCorrectionTex",
     ],
@@ -457,7 +457,7 @@ APPROXIMATION_NOTES: dict[str, str] = {
     "ShaderNodeTexMagic": "Magic is approximated with Octane Marble",
     "ShaderNodeTexWhiteNoise": "White Noise is approximated with Octane Noise",
     "ShaderNodeTexGabor": "Gabor is approximated with Octane Noise",
-    "ShaderNodeRGBCurves": "RGB Curves uses Color Correction and cannot preserve arbitrary curves",
+    "ShaderNodeRGBCurve": "RGB Curves uses Color Correction and cannot preserve arbitrary curves",
     "ShaderNodeValToRGB": "Gradient transfer depends on Octane version and may preserve only endpoints",
     "ShaderNodeWavelength": "Wavelength is approximated by a static RGB value",
     "ShaderNodeShaderToRGB": "Shader to RGB has no physically equivalent Octane operation",
@@ -749,9 +749,10 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Color": ["Texture", "Input"],
         "Gamma": ["Gamma", "Power"],
     },
-    "ShaderNodeRGBCurves": {
-        "Color": ["Texture", "Input"],
-        "Fac":   ["Amount", "Factor"],
+    "ShaderNodeRGBCurve": {
+        "Color":  ["Input", "Texture"],
+        "Factor": ["Mask", "Amount", "Factor"],
+        "Fac":    ["Mask", "Amount", "Factor"],
     },
     "ShaderNodeMath": {
         "Value":     ["Input1", "Value1", "Value 1", "Input", "Value", "A"],
@@ -970,7 +971,7 @@ OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
     "ShaderNodeGamma": {
         "Color": ["OutTex", "Texture out", "Output"],
     },
-    "ShaderNodeRGBCurves": {
+    "ShaderNodeRGBCurve": {
         "Color": ["OutTex", "Texture out", "Output"],
     },
     "ShaderNodeMath": {

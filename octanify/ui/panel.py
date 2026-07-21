@@ -81,6 +81,23 @@ def _draw_conversion_console(
     else:
         material_hint.label(text="Compatibility - Universal workflow")
 
+    console.separator(factor=0.35)
+    layout_options = console.row(align=True)
+    layout_options.prop(
+        scene,
+        "octanify_auto_arrange",
+        text="Arrange Nodes",
+        toggle=True,
+        icon="NODETREE",
+    )
+    layout_options.prop(
+        scene,
+        "octanify_color_nodes",
+        text="Color Nodes",
+        toggle=True,
+        icon="COLOR",
+    )
+
     if is_active:
         console.separator(factor=0.45)
         _draw_progress(console, scene)
@@ -157,6 +174,11 @@ def _draw_node_tools(
         "octanify.preview_node_viewport",
         text="Preview Node in Viewport",
         icon="RESTRICT_VIEW_OFF",
+    )
+    utilities.operator(
+        "octanify.arrange_node_tree",
+        text="Arrange Current Node Tree",
+        icon="NODETREE",
     )
 
     quick_actions = utilities.row(align=True)

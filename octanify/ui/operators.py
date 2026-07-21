@@ -21,6 +21,20 @@ from ..core.conversion_engine import (
     reset_cache,
 )
 from ..core.gamma_system import update_material_gamma, update_all_materials_gamma
+from ..core.layout_engine import (
+    arrange_nodes,
+    graph_bounds,
+    style_smart_graphs,
+)
+from ..core.light_converter import (
+    SUPPORTED_LIGHT_TYPES,
+    convert_light_to_octane,
+    light_needs_octane_conversion,
+)
+from ..core.world_converter import (
+    convert_world_to_octane,
+    world_needs_octane_conversion,
+)
 from ..utils.logger import get_logger
 
 log = get_logger()
@@ -137,11 +151,48 @@ def _materials_for_objects(objects) -> list[bpy.types.Material]:
     return materials
 
 
+def _light_objects_for_objects(objects) -> list[bpy.types.Object]:
+    """Return one stable object representative per supported light datablock."""
+    lights = []
+    seen: set[int] = set()
+    for obj in objects:
+        light_data = getattr(obj, "data", None)
+        if (
+            getattr(obj, "type", None) != "LIGHT"
+            or getattr(light_data, "type", None) not in SUPPORTED_LIGHT_TYPES
+        ):
+            continue
+        identity = _rna_identity(light_data)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        lights.append(obj)
+    return lights
+
+
+def _scene_light_objects(scene: bpy.types.Scene) -> list[bpy.types.Object]:
+    return _light_objects_for_objects(getattr(scene, "objects", ()))
+
+
 def _node_graph_kind(node) -> str:
     try:
         return str(node.get("octanify_graph", ""))
     except (AttributeError, ReferenceError, TypeError):
         return ""
+
+
+def _node_tree_from_context(context: bpy.types.Context):
+    """Return the tree currently edited by the user, or the active material."""
+    space_data = getattr(context, "space_data", None)
+    if getattr(space_data, "type", "") == "NODE_EDITOR":
+        for attribute in ("edit_tree", "node_tree"):
+            tree = getattr(space_data, attribute, None)
+            if tree is not None:
+                return tree
+
+    obj = getattr(context, "active_object", None)
+    material = getattr(obj, "active_material", None) if obj is not None else None
+    return getattr(material, "node_tree", None)
 
 
 def _delete_cycles_nodes_from_material(material: bpy.types.Material) -> int:
@@ -250,11 +301,14 @@ def _set_progress(
 # ---------------------------------------------------------------------------
 
 class OCTANIFY_OT_convert(bpy.types.Operator):
-    """Convert Cycles materials while preserving both renderer graphs"""
+    """Convert detected Cycles materials, lights, and World data"""
 
     bl_idname = "octanify.convert"
     bl_label = "Convert to Octane"
-    bl_description = "Convert Cycles materials to Octane materials"
+    bl_description = (
+        "Convert detected Cycles materials, lights, and World environment "
+        "to Octane"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -262,7 +316,16 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
         if getattr(context.scene, "octanify_progress_active", False):
             return False
         if context.scene.octanify_batch_mode == "ACTIVE":
-            return context.active_object is not None
+            return (
+                context.active_object is not None
+                or any(
+                    light_needs_octane_conversion(light_obj)
+                    for light_obj in _scene_light_objects(context.scene)
+                )
+                or world_needs_octane_conversion(
+                    getattr(context.scene, "world", None)
+                )
+            )
         return True
 
     def _prepare_job(self, context: bpy.types.Context) -> bool:
@@ -271,17 +334,35 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
 
         self._batch_mode = context.scene.octanify_batch_mode
         self._gamma = context.scene.octanify_albedo_gamma
+        self._auto_arrange = getattr(
+            context.scene, "octanify_auto_arrange", True
+        )
+        self._color_nodes = getattr(
+            context.scene, "octanify_color_nodes", True
+        )
         self._objects = _objects_for_conversion(context)
-
-        if not self._objects:
-            self.report({"WARNING"}, "No objects selected for conversion")
-            return False
-
         self._work_items = _material_work_items(self._objects)
-        if not self._work_items:
+        self._light_objects = [
+            light_obj
+            for light_obj in _scene_light_objects(context.scene)
+            if light_needs_octane_conversion(light_obj)
+        ]
+        world = getattr(context.scene, "world", None)
+        self._world_to_convert = (
+            world if world_needs_octane_conversion(world) else None
+        )
+        self._lights_converted = 0
+        self._world_converted = False
+        self._scene_domains_done = False
+
+        if not (
+            self._work_items
+            or self._light_objects
+            or self._world_to_convert is not None
+        ):
             self.report(
                 {"WARNING"},
-                "No materials found on the selected object hierarchy",
+                "No Cycles materials, lights, or World found in this scope",
             )
             return False
         self._work_index = 0
@@ -295,7 +376,7 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
             context,
             0,
             100,
-            "Preparing materials",
+            "Preparing scene conversion",
             force_redraw=True,
         )
 
@@ -321,23 +402,100 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
     def _report_summary(self) -> None:
         from ..core.report import report_data
 
-        count = report_data.materials_converted
-        if count == 0:
+        material_count = report_data.materials_converted
+        light_count = getattr(self, "_lights_converted", 0)
+        world_count = 1 if getattr(self, "_world_converted", False) else 0
+        if material_count == 0 and light_count == 0 and world_count == 0:
             self.report(
                 {"WARNING"},
-                "No new Cycles materials were converted; check the conversion report",
-            )
-        elif self._batch_mode == "ACTIVE":
-            self.report(
-                {"INFO"},
-                f"Converted {count} material(s) across "
-                f"{len(self._objects)} selected/hierarchy object(s)",
+                "No new Cycles scene data was converted; check the report",
             )
         else:
+            parts = [f"{material_count} material(s)", f"{light_count} light(s)"]
+            if world_count:
+                parts.append("World")
             self.report(
                 {"INFO"},
-                f"Converted {count} material(s) across all objects",
+                f"Converted {', '.join(parts)} to Octane",
             )
+
+    def _convert_scene_domains(self, context: bpy.types.Context) -> None:
+        """Convert pending light and World data once per operator run."""
+        if getattr(self, "_scene_domains_done", False):
+            return
+        from ..core.report import report_data
+
+        self._scene_domains_done = True
+        self._lights_converted = 0
+        for light_obj in getattr(self, "_light_objects", ()):
+            try:
+                result = convert_light_to_octane(
+                    light_obj,
+                    auto_arrange=getattr(self, "_auto_arrange", True),
+                    color_nodes=getattr(self, "_color_nodes", True),
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                message = (
+                    f"[{getattr(light_obj, 'name', '?')}] "
+                    f"Light conversion failed: {exc}"
+                )
+                report_data.add_warning(message)
+                log.warning(message)
+                continue
+            self._lights_converted += 1
+            report_data.add_notice(
+                f"[{result['object_name'] or result['light_name']}] "
+                f"{result['type']} light converted at "
+                f"{result['octane_power']:.6g} Octane power"
+            )
+            if result.get("gobo_converted"):
+                source_kind = result.get("gobo_source_kind", "")
+                source_label = (
+                    "Light Wrangler gobo"
+                    if str(source_kind).startswith("LIGHT_WRANGLER")
+                    else "image gobo"
+                )
+                animation = " (animated)" if result.get("gobo_animated") else ""
+                report_data.add_notice(
+                    f"[{result['object_name'] or result['light_name']}] "
+                    f"{source_label} '{result.get('gobo_image_name') or '?'}' "
+                    f"converted with Perspective projection{animation}"
+                )
+
+        self._world_converted = False
+        world = getattr(self, "_world_to_convert", None)
+        if world is not None:
+            try:
+                result = convert_world_to_octane(
+                    world,
+                    auto_arrange=getattr(self, "_auto_arrange", True),
+                    color_nodes=getattr(self, "_color_nodes", True),
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                world_name = getattr(world, "name", "?")
+                message = f"[{world_name}] World conversion failed: {exc}"
+                report_data.add_warning(message)
+                log.warning(message)
+            else:
+                self._world_converted = True
+                description = (
+                    f"HDRI '{result['image_name']}'"
+                    if result["source_kind"] == "HDRI"
+                    else "flat-color World"
+                )
+                report_data.add_notice(
+                    f"[{result['world_name']}] {description} converted at "
+                    f"strength {result['source_strength']:.6g}"
+                )
+
+        try:
+            context.view_layer.update()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        try:
+            context.scene.update_tag()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
 
     def invoke(self, context: bpy.types.Context, _event) -> set[str]:
         app = getattr(bpy, "app", None)
@@ -389,6 +547,14 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
 
         total = len(self._work_items)
         if self._work_index >= total:
+            _set_progress(
+                context,
+                95,
+                100,
+                "Converting detected lights and World",
+                force_redraw=True,
+            )
+            self._convert_scene_domains(context)
             _set_progress(context, 100, 100, "Conversion complete", force_redraw=True)
             self._end_progress(context)
             self._report_summary()
@@ -415,8 +581,9 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
                     gamma_value=self._gamma,
                     obj=obj,
                     smart_conversion=True,
-                    auto_arrange=True,
+                    auto_arrange=getattr(self, "_auto_arrange", True),
                     progress_callback=_material_progress,
+                    color_nodes=getattr(self, "_color_nodes", True),
                 )
                 if converted is not None and slot is not None:
                     slot.material = converted
@@ -435,6 +602,14 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
             force_redraw=True,
         )
         if self._work_index >= total:
+            _set_progress(
+                context,
+                95,
+                100,
+                "Converting detected lights and World",
+                force_redraw=True,
+            )
+            self._convert_scene_domains(context)
             _set_progress(context, 100, 100, "Conversion complete", force_redraw=True)
             self._end_progress(context)
             self._report_summary()
@@ -456,12 +631,20 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
                 self._objects,
                 gamma_value=self._gamma,
                 smart_conversion=True,
-                auto_arrange=True,
+                auto_arrange=getattr(self, "_auto_arrange", True),
                 progress_callback=lambda completed, total, label: _set_progress(
                     context, completed, total, label
                 ),
                 reset_conversion_cache=True,
+                color_nodes=getattr(self, "_color_nodes", True),
             )
+            _set_progress(
+                context,
+                95,
+                100,
+                "Converting detected lights and World",
+            )
+            self._convert_scene_domains(context)
             _set_progress(
                 context,
                 100,
@@ -531,6 +714,77 @@ class OCTANIFY_OT_delete_cycles_nodes(bpy.types.Operator):
             f"Deleted {deleted_nodes} Cycles node(s) from "
             f"{changed_materials} material(s)",
         )
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Arrange current node tree
+# ---------------------------------------------------------------------------
+
+class OCTANIFY_OT_arrange_node_tree(bpy.types.Operator):
+    """Arrange the currently edited node tree immediately"""
+
+    bl_idname = "octanify.arrange_node_tree"
+    bl_label = "Arrange Current Node Tree"
+    bl_description = (
+        "Arrange the currently edited material or nested node-group tree; "
+        "this also works on materials converted in an earlier operation"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        if getattr(context.scene, "octanify_progress_active", False):
+            return False
+        tree = _node_tree_from_context(context)
+        return tree is not None and bool(getattr(tree, "nodes", ()))
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        tree = _node_tree_from_context(context)
+        if tree is None:
+            self.report({"WARNING"}, "No editable node tree found")
+            return {"CANCELLED"}
+
+        nodes = list(tree.nodes)
+        if not nodes:
+            self.report({"WARNING"}, "The current node tree is empty")
+            return {"CANCELLED"}
+
+        cycles_nodes = [
+            node for node in nodes if _node_graph_kind(node) == "cycles"
+        ]
+        octane_nodes = [
+            node for node in nodes if _node_graph_kind(node) == "octane"
+        ]
+        if cycles_nodes and octane_nodes:
+            # Keep Octanify's two renderer graphs distinct while arranging
+            # each graph, including nested frame contents.
+            style_smart_graphs(
+                tree,
+                cycles_nodes,
+                octane_nodes,
+                auto_arrange=True,
+                colorize=getattr(
+                    context.scene, "octanify_color_nodes", True
+                ),
+            )
+        else:
+            left, _bottom, _right, top = graph_bounds(nodes)
+            arrange_nodes(tree, nodes, (left, top))
+
+        try:
+            tree.update_tag()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+        screen = getattr(context, "screen", None)
+        for area in getattr(screen, "areas", ()) if screen is not None else ():
+            if getattr(area, "type", "") != "NODE_EDITOR":
+                continue
+            try:
+                area.tag_redraw()
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                pass
+        self.report({"INFO"}, f"Arranged {len(nodes)} node(s)")
         return {"FINISHED"}
 
 
@@ -948,6 +1202,7 @@ class OCTANIFY_OT_auto_connect_textures(bpy.types.Operator):
 classes = (
     OCTANIFY_OT_convert,
     OCTANIFY_OT_delete_cycles_nodes,
+    OCTANIFY_OT_arrange_node_tree,
     OCTANIFY_OT_update_selected_gamma,
     OCTANIFY_OT_update_all_gamma,
     OCTANIFY_OT_preview_node_viewport,

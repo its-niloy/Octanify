@@ -48,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from octanify.core.graph_engine import GraphEngine
 from octanify.core.gamma_system import apply_gamma
-from octanify.core.layout_engine import style_smart_graphs
+from octanify.core.layout_engine import arrange_nodes, style_smart_graphs
 from octanify.core.conversion_engine import (
     _apply_scale_correction,
     _handle_alpha,
@@ -75,6 +75,7 @@ from octanify.core.property_mapper import (
     _transfer_image_texture,
     _transfer_mapping,
     _transfer_principled,
+    _transfer_rgb_curve,
 )
 from octanify.core.report import report_data
 from octanify.core.shading_intent import (
@@ -86,10 +87,12 @@ from octanify.core.shading_intent import (
 from octanify.core.shader_detection import analyze_tree
 from octanify.core.volumetric_handler import handle_volumetrics
 from octanify.ui.operators import (
+    OCTANIFY_OT_arrange_node_tree,
     OCTANIFY_OT_convert,
     _delete_cycles_nodes_from_material,
     _find_preferred_material_node,
     _guess_texture_socket,
+    _node_tree_from_context,
     _set_progress,
 )
 from octanify.utils.cache import ConversionCache
@@ -213,7 +216,7 @@ class _Nodes(list):
             node = _Node(
                 "Separate",
                 type,
-                inputs=[_Socket("Input", None)],
+                inputs=[_Socket("Input", None), _Socket("Mask", 1.0)],
                 outputs=[_Socket("OutTex")],
             )
             _attach_sockets(node)
@@ -1163,6 +1166,45 @@ class GeometryNodesMaterialScanTests(unittest.TestCase):
 
 
 class OperatorUtilityTests(unittest.TestCase):
+    def test_arrange_action_uses_currently_edited_nested_tree(self) -> None:
+        source = _attach_sockets(
+            _Node(
+                "Source",
+                "ShaderNodeValue",
+                outputs=[_Socket("Value")],
+            )
+        )
+        target = _attach_sockets(
+            _Node(
+                "Target",
+                "ShaderNodeMath",
+                inputs=[_Socket("Value")],
+                outputs=[_Socket("Value")],
+            )
+        )
+        links = _Links()
+        links.new(source.outputs[0], target.inputs[0])
+        nested_tree = SimpleNamespace(nodes=[source, target], links=links)
+        material_tree = SimpleNamespace(nodes=[], links=[])
+        context = SimpleNamespace(
+            scene=SimpleNamespace(octanify_progress_active=False),
+            space_data=SimpleNamespace(
+                type="NODE_EDITOR",
+                edit_tree=nested_tree,
+                node_tree=material_tree,
+            ),
+            active_object=None,
+        )
+        operator = OCTANIFY_OT_arrange_node_tree()
+        reports = []
+        operator.report = lambda level, message: reports.append((level, message))
+
+        self.assertIs(_node_tree_from_context(context), nested_tree)
+        self.assertTrue(operator.poll(context))
+        self.assertEqual(operator.execute(context), {"FINISHED"})
+        self.assertLess(source.location[0], target.location[0])
+        self.assertTrue(any("Arranged 2 node(s)" in message for _, message in reports))
+
     def test_texture_filename_inference_still_has_regex_runtime(self) -> None:
         self.assertEqual(
             _guess_texture_socket(
@@ -1278,7 +1320,9 @@ class OperatorUtilityTests(unittest.TestCase):
         with patch(
             "octanify.ui.operators.convert_material",
             return_value=material,
-        ):
+        ) as convert_mock:
+            operator._auto_arrange = False
+            operator._color_nodes = False
             result = operator.modal(context, SimpleNamespace(type="TIMER"))
 
         self.assertEqual(result, {"FINISHED"})
@@ -1287,37 +1331,269 @@ class OperatorUtilityTests(unittest.TestCase):
         self.assertEqual(context.scene.octanify_progress_label, "Conversion complete")
         self.assertFalse(context.scene.octanify_progress_active)
         self.assertEqual(progress_ended, [True])
+        self.assertFalse(convert_mock.call_args.kwargs["auto_arrange"])
+        self.assertFalse(convert_mock.call_args.kwargs["color_nodes"])
 
 
 class LayoutTests(unittest.TestCase):
-    def test_framed_authored_graph_is_not_partially_rearranged(self) -> None:
-        frame = _Node("Frame", "NodeFrame")
-        frame.location.x = 100.0
-        frame.location.y = 300.0
-        framed = _Node("Framed", "ShaderNodeTexImage")
-        framed.parent = frame
-        framed.location.x = 40.0
-        framed.location.y = -60.0
-        authored = _Node("Authored", "ShaderNodeBsdfPrincipled")
-        authored.location.x = 700.0
-        authored.location.y = 50.0
-        converted = _Node("Converted", "OctaneStandardSurfaceMaterial")
-        tree = SimpleNamespace(nodes=[frame, framed, authored, converted], links=[])
+    @staticmethod
+    def _node(
+        name: str,
+        bl_idname: str,
+        input_names: tuple[str, ...] = (),
+        output_names: tuple[str, ...] = (),
+        location: tuple[float, float] = (0.0, 0.0),
+    ) -> _Node:
+        node = _attach_sockets(
+            _Node(
+                name,
+                bl_idname,
+                inputs=[_Socket(socket_name) for socket_name in input_names],
+                outputs=[_Socket(socket_name) for socket_name in output_names],
+            )
+        )
+        node.location.x, node.location.y = location
+        return node
+
+    @staticmethod
+    def _xy(node: _Node) -> tuple[float, float]:
+        try:
+            return float(node.location.x), float(node.location.y)
+        except AttributeError:
+            return float(node.location[0]), float(node.location[1])
+
+    def test_branch_order_follows_destination_socket_order(self) -> None:
+        first = self._node(
+            "First", "ShaderNodeTexImage", output_names=("Color",),
+            location=(0.0, 0.0),
+        )
+        second = self._node(
+            "Second", "ShaderNodeTexImage", output_names=("Color",),
+            location=(0.0, 300.0),
+        )
+        mix = self._node(
+            "Mix", "ShaderNodeMix", input_names=("A", "B"),
+            output_names=("Result",), location=(400.0, 0.0),
+        )
+        tree = SimpleNamespace(nodes=[first, second, mix], links=_Links())
+        tree.links.new(first.outputs[0], mix.inputs[0])
+        tree.links.new(second.outputs[0], mix.inputs[1])
+
+        arrange_nodes(tree, tree.nodes, (0.0, 0.0))
+
+        self.assertGreater(self._xy(first)[1], self._xy(second)[1])
+        self.assertGreater(self._xy(mix)[0], self._xy(first)[0])
+
+    def test_crossing_reduction_reorders_intermediate_branches(self) -> None:
+        upper = self._node(
+            "Upper", "ShaderNodeTexImage", output_names=("Color",),
+            location=(0.0, 300.0),
+        )
+        lower = self._node(
+            "Lower", "ShaderNodeTexImage", output_names=("Color",),
+            location=(0.0, 0.0),
+        )
+        first_math = self._node(
+            "First Math", "ShaderNodeMath", input_names=("Value",),
+            output_names=("Value",), location=(400.0, 300.0),
+        )
+        second_math = self._node(
+            "Second Math", "ShaderNodeMath", input_names=("Value",),
+            output_names=("Value",), location=(400.0, 0.0),
+        )
+        shader = self._node(
+            "Shader", "ShaderNodeBsdfPrincipled",
+            input_names=("Roughness", "Metallic"),
+            output_names=("BSDF",), location=(800.0, 0.0),
+        )
+        tree = SimpleNamespace(
+            nodes=[upper, lower, first_math, second_math, shader],
+            links=_Links(),
+        )
+        tree.links.new(upper.outputs[0], second_math.inputs[0])
+        tree.links.new(lower.outputs[0], first_math.inputs[0])
+        tree.links.new(first_math.outputs[0], shader.inputs[0])
+        tree.links.new(second_math.outputs[0], shader.inputs[1])
+
+        arrange_nodes(tree, tree.nodes, (0.0, 0.0))
+
+        self.assertGreater(
+            (
+                self._xy(upper)[1] - self._xy(lower)[1]
+            ) * (
+                self._xy(second_math)[1] - self._xy(first_math)[1]
+            ),
+            0.0,
+        )
+        self.assertGreater(self._xy(shader)[0], self._xy(first_math)[0])
+
+    def test_cycles_share_a_column_without_overlapping(self) -> None:
+        first = self._node(
+            "First", "ShaderNodeMath", input_names=("Value",),
+            output_names=("Value",),
+        )
+        second = self._node(
+            "Second", "ShaderNodeMath", input_names=("Value",),
+            output_names=("Value",),
+        )
+        output = self._node(
+            "Output", "ShaderNodeOutputMaterial", input_names=("Surface",),
+        )
+        tree = SimpleNamespace(nodes=[first, second, output], links=_Links())
+        tree.links.new(first.outputs[0], second.inputs[0])
+        tree.links.new(second.outputs[0], first.inputs[0])
+        tree.links.new(second.outputs[0], output.inputs[0])
+
+        arrange_nodes(tree, tree.nodes, (0.0, 0.0))
+
+        self.assertEqual(self._xy(first)[0], self._xy(second)[0])
+        self.assertNotEqual(self._xy(first)[1], self._xy(second)[1])
+        self.assertGreater(self._xy(output)[0], self._xy(first)[0])
+
+    def test_disconnected_components_are_packed_without_overlap(self) -> None:
+        source = self._node(
+            "Source", "ShaderNodeTexImage", output_names=("Color",),
+        )
+        target = self._node(
+            "Target", "ShaderNodeBsdfPrincipled", input_names=("Base Color",),
+        )
+        isolated = self._node("Isolated", "ShaderNodeValue")
+        tree = SimpleNamespace(nodes=[source, target, isolated], links=_Links())
+        tree.links.new(source.outputs[0], target.inputs[0])
+
+        arrange_nodes(tree, tree.nodes, (0.0, 0.0))
+
+        self.assertLess(
+            self._xy(isolated)[1],
+            min(self._xy(source)[1], self._xy(target)[1]) - 140.0,
+        )
+
+    def test_frame_cluster_moves_without_changing_child_coordinates(self) -> None:
+        frame = self._node(
+            "Frame", "NodeFrame", location=(100.0, 300.0)
+        )
+        child = self._node(
+            "Child", "ShaderNodeTexImage", output_names=("Color",),
+            location=(40.0, -60.0),
+        )
+        child.parent = frame
+        output = self._node(
+            "Output", "ShaderNodeOutputMaterial", input_names=("Surface",),
+            location=(700.0, 0.0),
+        )
+        tree = SimpleNamespace(nodes=[frame, child, output], links=_Links())
+        tree.links.new(child.outputs[0], output.inputs[0])
+
+        arrange_nodes(tree, tree.nodes, (0.0, 0.0))
+
+        self.assertEqual(self._xy(child), (40.0, -60.0))
+        self.assertNotEqual(self._xy(frame), (100.0, 300.0))
+        self.assertGreater(self._xy(output)[0], self._xy(frame)[0])
+
+    def test_layout_is_idempotent_for_the_same_origin(self) -> None:
+        source = self._node(
+            "Source", "ShaderNodeTexImage", output_names=("Color",),
+        )
+        target = self._node(
+            "Target", "ShaderNodeBsdfPrincipled", input_names=("Base Color",),
+        )
+        tree = SimpleNamespace(nodes=[source, target], links=_Links())
+        tree.links.new(source.outputs[0], target.inputs[0])
+
+        arrange_nodes(tree, tree.nodes, (25.0, 75.0))
+        first_layout = [self._xy(node) for node in tree.nodes]
+        arrange_nodes(tree, tree.nodes, (25.0, 75.0))
+
+        self.assertEqual(
+            [self._xy(node) for node in tree.nodes], first_layout
+        )
+
+    def test_framed_authored_graph_arranges_frame_contents(self) -> None:
+        frame = self._node("Frame", "NodeFrame", location=(100.0, 300.0))
+        source = self._node(
+            "Source",
+            "ShaderNodeTexImage",
+            output_names=("Color",),
+            location=(500.0, -300.0),
+        )
+        target = self._node(
+            "Target",
+            "ShaderNodeBsdfPrincipled",
+            input_names=("Base Color",),
+            location=(-400.0, 250.0),
+        )
+        source.parent = frame
+        target.parent = frame
+        authored = self._node(
+            "Authored", "ShaderNodeBsdfPrincipled", location=(700.0, 50.0)
+        )
+        converted = self._node(
+            "Converted", "OctaneStandardSurfaceMaterial"
+        )
+        tree = SimpleNamespace(
+            nodes=[frame, source, target, authored, converted],
+            links=_Links(),
+        )
+        tree.links.new(source.outputs[0], target.inputs[0])
 
         style_smart_graphs(
             tree,
-            [frame, framed, authored],
+            [frame, source, target, authored],
             [converted],
             auto_arrange=True,
         )
 
-        self.assertEqual((frame.location.x, frame.location.y), (100.0, 300.0))
-        self.assertEqual((framed.location.x, framed.location.y), (40.0, -60.0))
-        self.assertEqual((authored.location.x, authored.location.y), (700.0, 50.0))
-        self.assertGreaterEqual(converted.location[0], 1860.0)
+        self.assertLess(self._xy(source)[0], self._xy(target)[0])
+        self.assertGreater(
+            self._xy(converted)[0],
+            max(self._xy(frame)[0], self._xy(authored)[0]),
+        )
+
+    def test_graph_tags_remain_when_custom_colors_are_disabled(self) -> None:
+        cycles = self._node("Cycles", "ShaderNodeBsdfPrincipled")
+        octane = self._node("Octane", "OctaneStandardSurfaceMaterial")
+        tree = SimpleNamespace(nodes=[cycles, octane], links=[])
+
+        style_smart_graphs(
+            tree,
+            [cycles],
+            [octane],
+            auto_arrange=False,
+            colorize=False,
+        )
+
+        self.assertFalse(cycles.use_custom_color)
+        self.assertFalse(octane.use_custom_color)
 
 
 class SocketResolutionTests(unittest.TestCase):
+    def test_rgb_curve_factor_maps_to_color_correction_mask(self) -> None:
+        node = _attach_sockets(
+            _Node(
+                "Color correction",
+                "OctaneColorCorrection",
+                inputs=[_Socket("Input"), _Socket("Mask", 1.0)],
+                outputs=[_Socket("Texture out")],
+            )
+        )
+
+        resolved_input = resolve_input_socket(
+            "ShaderNodeRGBCurve",
+            "Factor",
+            node,
+            socket_identifier="Factor",
+            socket_index=0,
+        )
+        resolved_output = resolve_output_socket(
+            "ShaderNodeRGBCurve",
+            "Color",
+            node,
+            socket_identifier="Color",
+        )
+
+        self.assertIs(resolved_input, node.inputs.get("Mask"))
+        self.assertIs(resolved_output, node.outputs.get("Texture out"))
+
     def test_unique_identifier_wins_for_duplicate_mix_shader_names(self) -> None:
         material_1 = SimpleNamespace(name="Material1")
         material_2 = SimpleNamespace(name="Material2")
@@ -1434,6 +1710,43 @@ class ModernOctaneNodeTests(unittest.TestCase):
         self.assertEqual(
             NODE_TYPE_MAP["ShaderNodeMixShader"][0],
             "OctaneMixMaterial",
+        )
+
+    def test_rgb_curve_uses_blenders_singular_rna_identifier(self) -> None:
+        self.assertEqual(
+            NODE_TYPE_MAP["ShaderNodeRGBCurve"][0],
+            "OctaneColorCorrection",
+        )
+        self.assertNotIn("ShaderNodeRGBCurves", NODE_TYPE_MAP)
+
+    def test_rgb_curve_creates_color_correction_without_unsupported_fallback(self) -> None:
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeRGBCurve",
+            label="RGB Curves",
+            location=(0.0, 0.0),
+            properties={},
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("RGB Curves", info),)),
+            links=[],
+        )
+        tree = SimpleNamespace(
+            name="RGB Curve Group",
+            nodes=_Nodes(),
+            links=_Links(),
+        )
+        report_data.clear()
+
+        node_map = GraphEngine(analysis).create_nodes(tree)
+
+        self.assertEqual(
+            node_map["RGB Curves"].bl_idname,
+            "OctaneColorCorrection",
+        )
+        self.assertEqual(report_data.nodes_unsupported, 0)
+        self.assertTrue(
+            any("cannot preserve arbitrary curves" in message
+                for message in report_data.approximations)
         )
 
 
@@ -2086,6 +2399,23 @@ class EmissionReconstructionTests(unittest.TestCase):
 
 
 class PropertyTransferTests(unittest.TestCase):
+    def test_rgb_curve_factor_is_preserved_as_color_correction_mask(self) -> None:
+        node = _attach_sockets(
+            _Node(
+                "Color correction",
+                "OctaneColorCorrection",
+                inputs=[_Socket("Mask", 1.0)],
+            )
+        )
+        info = SimpleNamespace(
+            inputs={"Factor": 0.35},
+            input_identifiers={"Factor": "Factor"},
+        )
+
+        _transfer_rgb_curve(info, node)
+
+        self.assertEqual(node.inputs.get("Mask").default_value, 0.35)
+
     def test_standard_surface_maps_principled_layers_without_enabling_them(self) -> None:
         node = _attach_sockets(
             _Node(

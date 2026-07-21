@@ -64,13 +64,21 @@ def _register_properties() -> None:
     )
 
     bpy.types.Scene.octanify_auto_arrange = bpy.props.BoolProperty(
-        name="Auto Arrange Node Trees",
+        name="Arrange After Conversion",
         description=(
-            "Arrange and visually separate the Cycles and Octane graphs "
-            "after conversion"
+            "Arrange converted material, light, World, and nested node-group "
+            "graphs, including nodes inside frames"
         ),
         default=True,
-        options={"HIDDEN"},
+    )
+
+    bpy.types.Scene.octanify_color_nodes = bpy.props.BoolProperty(
+        name="Color Converted Nodes",
+        description=(
+            "Color preserved Cycles and generated Octane graphs for easier "
+            "visual identification"
+        ),
+        default=True,
     )
 
     bpy.types.Scene.octanify_progress = bpy.props.IntProperty(
@@ -159,6 +167,7 @@ def _unregister_properties() -> None:
         "octanify_batch_mode",
         "octanify_smart_conversion",
         "octanify_auto_arrange",
+        "octanify_color_nodes",
         "octanify_progress",
         "octanify_progress_label",
         "octanify_progress_active",

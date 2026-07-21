@@ -654,6 +654,14 @@ def _transfer_gamma_node(info: "NodeInfo", node: "bpy.types.Node") -> None:
     _set_input(node, ["Gamma", "Power"], _get_input_value(info, "Gamma", 1.0))
 
 
+def _transfer_rgb_curve(info: "NodeInfo", node: "bpy.types.Node") -> None:
+    """RGB Curves → Octane Color Correction approximation."""
+    factor = _get_input_value(info, "Factor")
+    if factor is None:
+        factor = _get_input_value(info, "Fac", 1.0)
+    _set_input(node, ["Mask", "Amount", "Factor"], factor)
+
+
 def _transfer_math(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Math → Octane Math Wrapper."""
     op = info.properties.get("operation", "ADD")
@@ -1145,7 +1153,7 @@ _HANDLERS: dict[str, callable] = {
     "ShaderNodeBsdfTransparent": lambda info, node: None,  # null material, no params
     "ShaderNodeTexGradient": lambda info, node: None,
     "ShaderNodeTexBrick": lambda info, node: None,
-    "ShaderNodeRGBCurves": lambda info, node: None,  # complex, best-effort
+    "ShaderNodeRGBCurve": _transfer_rgb_curve,
     "ShaderNodeNewGeometry": lambda info, node: None,
     "ShaderNodeLightPath": lambda info, node: None,
 
