@@ -9,6 +9,12 @@ import bpy
 
 
 TERMS = (
+    "composite",
+    "noise",
+    "voronoi",
+    "fractal",
+    "fbm",
+    "cell",
     "gradient",
     "normal",
     "bump",
@@ -20,6 +26,53 @@ TERMS = (
     "portal",
 )
 
+TARGETS = (
+    "OctaneCompositeTexture",
+    "OctaneTexLayerTexture",
+    "OctaneCompositeTextureLayer",
+    "OctaneCinema4DNoise",
+    "OctaneSmoothVoronoiContours",
+    "OctaneCellNoise",
+    "OctaneFractalNoise",
+    "OctaneFBMNoise",
+    "Octane3DTransformation",
+    "OctaneXYZToUVW",
+    "OctaneTransformValue",
+)
+
+
+def _value(value):
+    if hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+        try:
+            return list(value)
+        except TypeError:
+            pass
+    return value
+
+
+def _socket_record(socket) -> dict:
+    record = {
+        "name": socket.name,
+        "identifier": getattr(socket, "identifier", ""),
+        "bl_idname": getattr(socket, "bl_idname", ""),
+    }
+    if hasattr(socket, "default_value"):
+        record["default"] = _value(socket.default_value)
+    try:
+        prop = socket.bl_rna.properties.get("default_value")
+        if prop is not None and prop.type == "ENUM":
+            record["enum_items"] = [
+                {
+                    "identifier": item.identifier,
+                    "name": item.name,
+                    "value": item.value,
+                }
+                for item in prop.enum_items
+            ]
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    return record
+
 
 def main() -> None:
     if not addon_utils.check("octane")[1]:
@@ -29,17 +82,25 @@ def main() -> None:
     material.use_nodes = True
     tree = material.node_tree
 
-    for type_name in dir(bpy.types):
-        if not any(term in type_name.lower() for term in TERMS):
-            continue
+    type_names = list(TARGETS)
+    type_names.extend(
+        type_name for type_name in dir(bpy.types)
+        if any(term in type_name.lower() for term in TERMS)
+        and type_name not in TARGETS
+    )
+    for type_name in type_names:
         node_type = getattr(bpy.types, type_name, None)
-        try:
-            if not isinstance(node_type, type) or not issubclass(node_type, bpy.types.Node):
+        if type_name in TARGETS:
+            bl_idname = type_name
+        else:
+            try:
+                if not isinstance(node_type, type) or not issubclass(node_type, bpy.types.Node):
+                    continue
+            except TypeError:
                 continue
-        except TypeError:
+            bl_idname = getattr(node_type, "bl_idname", "") or type_name
+        if not (type_name.startswith("Octane") or bl_idname.startswith("Octane")):
             continue
-
-        bl_idname = getattr(node_type, "bl_idname", "") or type_name
         record = {
             "rna_name": type_name,
             "bl_idname": bl_idname,
@@ -49,8 +110,10 @@ def main() -> None:
         }
         try:
             node = tree.nodes.new(type=bl_idname)
-            record["inputs"] = [socket.name for socket in node.inputs]
-            record["outputs"] = [socket.name for socket in node.outputs]
+            record["bl_idname"] = node.bl_idname
+            record["bl_label"] = node.bl_label
+            record["inputs"] = [_socket_record(socket) for socket in node.inputs]
+            record["outputs"] = [_socket_record(socket) for socket in node.outputs]
             tree.nodes.remove(node)
         except Exception as exc:
             record["creation_error"] = str(exc)

@@ -120,10 +120,12 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneRGBImage",
     ],
     "ShaderNodeTexNoise": [
+        "OctaneCinema4DNoise",
         "ShaderNodeOctNoiseTex",
         "OctaneNoiseTexture",
     ],
     "ShaderNodeTexVoronoi": [
+        "OctaneCinema4DNoise",
         "OctaneSmoothVoronoiContours",
         "OctaneCellNoise",
         "ShaderNodeOctVoronoiTex",
@@ -135,6 +137,7 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneWaveTexture",
     ],
     "ShaderNodeTexMusgrave": [
+        "OctaneCinema4DNoise",
         "ShaderNodeOctNoiseTex",
         "OctaneNoiseTexture",
     ],
@@ -180,11 +183,13 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneGradientTexture",
     ],
     "ShaderNodeMixRGB": [
+        "OctaneCompositeTexture",
         "OctaneCyclesMixColorNodeWrapper",
         "ShaderNodeOctMixTex",
         "OctaneMixTexture",
     ],
     "ShaderNodeMix": [
+        "OctaneCompositeTexture",
         "OctaneCyclesMixColorNodeWrapper",
         "ShaderNodeOctMixTex",
         "OctaneMixTexture",
@@ -447,9 +452,9 @@ APPROXIMATION_NOTES: dict[str, str] = {
     "ShaderNodeBackground": "Background is material-scoped; world environment conversion is not automatic",
     "ShaderNodeHoldout": "Holdout is approximated with Null Material",
     "ShaderNodeEeveeSpecular": "Specular BSDF is approximated with Octane Specular Material",
-    "ShaderNodeTexMusgrave": "Musgrave is approximated with Octane Noise",
-    "ShaderNodeTexNoise": "Cycles and Octane Noise algorithms and multi-outputs differ",
-    "ShaderNodeTexVoronoi": "Voronoi feature/distance modes require manual verification",
+    "ShaderNodeTexMusgrave": "Musgrave is approximated with Octane Cinema 4D Noise",
+    "ShaderNodeTexNoise": "Cycles Noise is approximated with Octane Cinema 4D FBM",
+    "ShaderNodeTexVoronoi": "Voronoi feature/distance modes are approximated with Cinema 4D Voronoi",
     "ShaderNodeTexWave": "Cycles and Octane Wave modes are not one-to-one",
     "ShaderNodeTexChecker": "Checker factor and color outputs may share one Octane texture output",
     "ShaderNodeTexGradient": "Gradient modes differ between Cycles and Octane",
@@ -663,15 +668,20 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Vector": ["Projection", "UV transform", "Transform", "UVTransform", "UV"],
     },
     "ShaderNodeTexNoise": {
-        "Vector": ["Transform", "UVTransform"],
+        "Vector": ["UVW transform", "UV transform", "Transform", "UVTransform", "Projection"],
         "Scale":  ["Omega", "W", "Scale"],
         "Detail": ["Octaves", "Detail"],
-        "Roughness": ["Lacunarity", "Roughness"],
+        "Roughness": ["Gain", "Roughness"],
+        "Lacunarity": ["Lacunarity"],
         "Distortion": ["Distortion"],
     },
     "ShaderNodeTexVoronoi": {
-        "Vector": ["Transform", "UVTransform"],
+        "Vector": ["UVW transform", "UV transform", "Transform", "UVTransform", "Projection"],
         "Scale":  ["Scale"],
+        "Detail": ["Octaves", "Detail"],
+        "Roughness": ["Gain", "Roughness"],
+        "Lacunarity": ["Lacunarity"],
+        "W": ["T", "W"],
         "Randomness": ["Randomness"],
     },
     "ShaderNodeTexWave": {
@@ -679,9 +689,15 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Scale":  ["Scale"],
     },
     "ShaderNodeTexMusgrave": {
-        "Vector": ["Transform", "UVTransform"],
+        "Vector": ["UVW transform", "UV transform", "Transform", "UVTransform", "Projection"],
         "Scale":  ["Omega", "W", "Scale"],
         "Detail": ["Octaves", "Detail"],
+        "Roughness": ["Gain", "Roughness"],
+        "Lacunarity": ["Lacunarity"],
+    },
+    "ShaderNodeTexWhiteNoise": {
+        "Vector": ["Projection", "UVW transform", "UV transform", "Transform", "UVTransform"],
+        "W": ["T", "W"],
     },
     "ShaderNodeTexChecker": {
         "Vector": ["Transform", "UVTransform"],
@@ -710,14 +726,14 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Normal": ["Normal"],
     },
     "ShaderNodeMixRGB": {
-        "Fac":    ["Amount", "Factor"],
-        "Color1": ["Texture1", "Color1", "Input1"],
-        "Color2": ["Texture2", "Color2", "Input2"],
+        "Fac":    ["Opacity", "Amount", "Factor"],
+        "Color1": ["Input", "Texture1", "Color1", "Input1"],
+        "Color2": ["Input", "Texture2", "Color2", "Input2"],
     },
     "ShaderNodeMix": {
-        "Factor":  ["Amount", "Factor"],
-        "A":       ["Texture1", "Color1", "Input1"],
-        "B":       ["Texture2", "Color2", "Input2"],
+        "Factor":  ["Opacity", "Amount", "Factor"],
+        "A":       ["Input", "Texture1", "Color1", "Input1"],
+        "B":       ["Input", "Texture2", "Color2", "Input2"],
     },
     "ShaderNodeMixFloat": {
         "Factor":  ["Amount", "Factor"],
@@ -934,6 +950,10 @@ OUTPUT_MAP: dict[str, dict[str, list[str]]] = {
     },
     "ShaderNodeTexMusgrave": {
         "Fac": ["OutTex", "Texture out", "Output"],
+    },
+    "ShaderNodeTexWhiteNoise": {
+        "Value": ["OutTex", "Texture out", "Output"],
+        "Color": ["OutTex", "Texture out", "Output"],
     },
     "ShaderNodeTexChecker": {
         "Color": ["OutTex", "Texture out", "Output"],

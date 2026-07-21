@@ -75,6 +75,9 @@ class GraphEngine:
         # appropriate variant.
         self._created_variants: dict[str, list["bpy.types.Node"]] = {}
         self._output_variants: dict[tuple[str, str], "bpy.types.Node"] = {}
+        self._mix_input_variants: dict[
+            tuple[str, str], "bpy.types.Node"
+        ] = {}
         self._image_role_variants: dict[
             str, dict[TextureTreatment, "bpy.types.Node"]
         ] = {}
@@ -458,6 +461,22 @@ class GraphEngine:
         A simple source-to-all-target fan-out would attach the color instance
         to both branches and leave the linear instance unused.
         """
+        mix_target = None
+        for socket_key in (
+            getattr(link_info, "to_socket_identifier", ""),
+            link_info.to_socket,
+        ):
+            if not socket_key:
+                continue
+            mix_target = self._mix_input_variants.get(
+                (link_info.to_node, socket_key)
+            )
+            if mix_target is not None:
+                break
+        if mix_target is not None:
+            source = self.source_node_for(link_info, node_map)
+            return [(source, mix_target)] if source is not None else []
+
         treatments = self.intent_treatments_for_link(link_info)
         target_variants = self._node_treatment_variants.get(
             link_info.to_node, {}
@@ -513,6 +532,215 @@ class GraphEngine:
             seen.add(key)
             unique.append((source, target))
         return unique
+
+    @staticmethod
+    def _tag_mix_layer(node, role: str) -> None:
+        try:
+            node["octanify_mix_layer"] = role
+        except (AttributeError, RuntimeError, TypeError):
+            try:
+                setattr(node, "octanify_mix_layer", role)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+
+    def _legacy_mix_fallback(
+        self,
+        target_tree: "bpy.types.NodeTree",
+        info,
+        primary: "bpy.types.Node",
+    ):
+        candidates = [
+            candidate
+            for candidate in NODE_TYPE_MAP.get(info.bl_idname, ())
+            if candidate != "OctaneCompositeTexture"
+        ]
+        fallback = create_node_from_candidates(
+            target_tree,
+            candidates,
+            label=info.label,
+        )
+        if fallback is None:
+            return primary
+        fallback.location = info.location
+        self._apply_common_state(fallback, info)
+        try:
+            target_tree.nodes.remove(primary)
+        except (RuntimeError, TypeError):
+            pass
+        return fallback
+
+    def _expand_composite_mix(
+        self,
+        target_tree: "bpy.types.NodeTree",
+        node_name: str,
+        info,
+        primary: "bpy.types.Node",
+    ) -> "bpy.types.Node":
+        """Build Composite Texture + two layers transactionally."""
+        if (
+            info.bl_idname not in {"ShaderNodeMixRGB", "ShaderNodeMix"}
+            or getattr(primary, "bl_idname", "") != "OctaneCompositeTexture"
+        ):
+            return primary
+
+        layers = []
+        for role, y_offset in (("base", -90), ("blend", 90)):
+            layer = create_node_from_candidates(
+                target_tree,
+                ("OctaneTexLayerTexture", "OctaneCompositeTextureLayer"),
+                label=f"{info.label} [{role.title()}]",
+            )
+            if layer is None:
+                for created in layers:
+                    try:
+                        target_tree.nodes.remove(created)
+                    except (RuntimeError, TypeError):
+                        pass
+                from .report import report_data
+                report_data.add_warning(
+                    f"[{self.report_context_name or target_tree.name}] "
+                    f"Composite layers unavailable for '{node_name}'; used "
+                    "the legacy Mix fallback"
+                )
+                return self._legacy_mix_fallback(target_tree, info, primary)
+            layer.location = (info.location[0] - 220, info.location[1] + y_offset)
+            self._apply_common_state(layer, info)
+            self._tag_mix_layer(layer, role)
+            layers.append(layer)
+
+        constants = []
+        try:
+            base_output = (
+                layers[0].outputs.get("Texture layer out")
+                or layers[0].outputs.get("Composite texture layer out")
+                or layers[0].outputs[0]
+            )
+            blend_output = (
+                layers[1].outputs.get("Texture layer out")
+                or layers[1].outputs.get("Composite texture layer out")
+                or layers[1].outputs[0]
+            )
+            base_input = (
+                primary.inputs.get("Layer1")
+                or primary.inputs.get("Layer 1")
+            )
+            blend_input = (
+                primary.inputs.get("Layer2")
+                or primary.inputs.get("Layer 2")
+            )
+            if base_input is None or blend_input is None:
+                raise KeyError("Composite Texture layer sockets are unavailable")
+            target_tree.links.new(base_output, base_input)
+            target_tree.links.new(blend_output, blend_input)
+
+            if info.bl_idname == "ShaderNodeMixRGB":
+                constant_specs = (
+                    ("Color1", {"Color1"}, layers[0]),
+                    ("Color2", {"Color2"}, layers[1]),
+                )
+            else:
+                constant_specs = (
+                    ("A_Color", {"A", "A_Color"}, layers[0]),
+                    ("B_Color", {"B", "B_Color"}, layers[1]),
+                )
+            for preferred_identifier, aliases, layer in constant_specs:
+                is_linked = any(
+                    link.to_node == node_name
+                    and (
+                        getattr(link, "to_socket_identifier", "") in aliases
+                        or link.to_socket in aliases
+                    )
+                    for link in self.analysis.links
+                )
+                if is_linked:
+                    continue
+                value = info.inputs.get(preferred_identifier)
+                if value is None:
+                    for identifier, display_name in info.input_identifiers.items():
+                        if display_name in aliases and identifier in info.inputs:
+                            value = info.inputs[identifier]
+                            if identifier.endswith("_Color"):
+                                break
+                if value is None:
+                    continue
+                color = list(value) if hasattr(value, "__len__") else [value] * 3
+                if len(color) < 3:
+                    color.extend([color[-1] if color else 0.0] * (3 - len(color)))
+                rgb = tuple(float(component) for component in color[:3])
+                constant = create_node_from_candidates(
+                    target_tree,
+                    ("OctaneRGBColor", "ShaderNodeOctRGBColorTex"),
+                    label=f"{info.label} [{preferred_identifier} Constant]",
+                )
+                if constant is None:
+                    raise RuntimeError("Octane RGB constant node is unavailable")
+                constants.append(constant)
+                constant.location = (
+                    layer.location[0] - 220,
+                    layer.location[1],
+                )
+                value_set = False
+                try:
+                    constant.a_value = rgb
+                    value_set = True
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+                if not value_set:
+                    for socket_name in ("Color", "Input"):
+                        socket = constant.inputs.get(socket_name)
+                        if socket is None or not hasattr(socket, "default_value"):
+                            continue
+                        socket.default_value = rgb
+                        value_set = True
+                        break
+                if not value_set:
+                    try:
+                        constant.default_value = rgb
+                        value_set = True
+                    except (AttributeError, RuntimeError, TypeError):
+                        pass
+                if not value_set:
+                    raise RuntimeError("Octane RGB constant value is unavailable")
+                constant_output = (
+                    constant.outputs.get("Texture out")
+                    or constant.outputs.get("OutTex")
+                    or constant.outputs[0]
+                )
+                layer_input = layer.inputs.get("Input")
+                if layer_input is None:
+                    raise KeyError("Composite layer Input socket is unavailable")
+                target_tree.links.new(constant_output, layer_input)
+        except (AttributeError, KeyError, IndexError, RuntimeError, TypeError):
+            for created in [*constants, *layers]:
+                try:
+                    target_tree.nodes.remove(created)
+                except (RuntimeError, TypeError):
+                    pass
+            from .report import report_data
+            report_data.add_warning(
+                f"[{self.report_context_name or target_tree.name}] Could not "
+                f"wire Composite Texture layers for '{node_name}'; used the "
+                "legacy Mix fallback"
+            )
+            return self._legacy_mix_fallback(target_tree, info, primary)
+
+        self._created_variants[node_name] = [primary, *layers]
+        if info.bl_idname == "ShaderNodeMixRGB":
+            routing = {
+                "Fac": layers[1],
+                "Color1": layers[0],
+                "Color2": layers[1],
+            }
+        else:
+            routing = {
+                "Factor": layers[1],
+                "Fac": layers[1],
+                "A": layers[0],
+                "B": layers[1],
+            }
+        for socket_name, target in routing.items():
+            self._mix_input_variants[(node_name, socket_name)] = target
+        return primary
 
     def source_node_for(
         self,
@@ -883,6 +1111,18 @@ class GraphEngine:
                 node_name,
                 outgoing_links=self._outgoing.get(node_name, []),
             )
+            if (
+                info.bl_idname == "ShaderNodeMix"
+                and info.properties.get("data_type", "RGBA") != "RGBA"
+            ):
+                # Composite Texture is a color-layer node. Float and vector
+                # modes of Blender's polymorphic Mix node keep the established
+                # generic Mix conversion path.
+                preferred_candidates = [
+                    candidate
+                    for candidate in preferred_candidates
+                    if candidate != "OctaneCompositeTexture"
+                ]
             image_treatments = (
                 self.intent_treatments_for(node_name)
                 if info.bl_idname == "ShaderNodeTexImage"
@@ -906,6 +1146,9 @@ class GraphEngine:
             if new_node is not None:
                 new_node.location = info.location
                 self._apply_common_state(new_node, info)
+                new_node = self._expand_composite_mix(
+                    target_tree, node_name, info, new_node
+                )
                 new_node = self._expand_channel_split(
                     target_tree, node_name, info, new_node
                 )

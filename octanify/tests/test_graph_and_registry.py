@@ -57,6 +57,7 @@ from octanify.core.conversion_engine import (
     _handle_principled_material_inputs,
     _rebuild_links,
     _route_original_outputs_to_cycles,
+    _specialize_bbox_relative_materials,
     collect_material_work_items,
     convert_material,
     convert_objects_materials,
@@ -70,6 +71,11 @@ from octanify.core.node_registry import (
     resolve_output_socket,
 )
 from octanify.core.property_mapper import (
+    _transfer_mix,
+    _transfer_mix_rgb,
+    _transfer_noise,
+    _transfer_voronoi,
+    _transfer_white_noise,
     _transfer_displacement,
     _transfer_glass,
     _transfer_image_texture,
@@ -79,6 +85,7 @@ from octanify.core.property_mapper import (
 )
 from octanify.core.report import report_data
 from octanify.core.shading_intent import (
+    CoordinateSource,
     Role,
     ShadingIntentMap,
     TextureTreatment,
@@ -123,6 +130,16 @@ class _Node:
         self.parent = None
         self.width = 160.0
         self.dimensions = SimpleNamespace(y=140.0)
+        self._custom_properties = {}
+
+    def __setitem__(self, key, value) -> None:
+        self._custom_properties[key] = value
+
+    def __getitem__(self, key):
+        return self._custom_properties[key]
+
+    def get(self, key, default=None):
+        return self._custom_properties.get(key, default)
 
 
 class _Links(list):
@@ -149,6 +166,129 @@ class _Nodes(list):
         return next((node for node in self if node.name == name), None)
 
     def new(self, type: str):
+        if type == "OctaneCompositeTexture":
+            node = _Node(
+                "Composite texture",
+                type,
+                inputs=[
+                    _Socket("Clamp", False),
+                    _Socket("Layer 2", None),
+                    _Socket("Layer 1", None),
+                ],
+                outputs=[_Socket("Texture out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in ("OctaneTexLayerTexture", "OctaneCompositeTextureLayer"):
+            output_name = (
+                "Texture layer out"
+                if type == "OctaneTexLayerTexture"
+                else "Composite texture layer out"
+            )
+            node = _Node(
+                "Composite Texture Layer",
+                type,
+                inputs=[
+                    _Socket("Enabled", True),
+                    _Socket("Input", (0.5, 0.5, 0.5, 1.0)),
+                    _Socket("Opacity", 1.0),
+                    _Socket("Blend mode", "Mix|Normal"),
+                ],
+                outputs=[_Socket(output_name)],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in ("OctaneRGBColor", "ShaderNodeOctRGBColorTex"):
+            node = _Node(
+                "RGB color",
+                type,
+                outputs=[_Socket("Texture out")],
+            )
+            node.a_value = (0.7, 0.7, 0.7)
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in (
+            "OctaneCyclesMixColorNodeWrapper",
+            "ShaderNodeOctMixTex",
+            "OctaneMixTexture",
+        ):
+            node = _Node(
+                "Mix",
+                type,
+                inputs=[
+                    _Socket("Factor", 0.5),
+                    _Socket("A", (0.0, 0.0, 0.0, 1.0)),
+                    _Socket("B", (1.0, 1.0, 1.0, 1.0)),
+                    _Socket("Blend Type", "Mix"),
+                    _Socket("Clamp Result", False),
+                ],
+                outputs=[_Socket("Texture out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type == "OctaneCyclesMixFloatNodeWrapper":
+            node = _Node(
+                "Float Mix",
+                type,
+                inputs=[
+                    _Socket("Amount", 0.5),
+                    _Socket("Texture1", 0.0),
+                    _Socket("Texture2", 1.0),
+                ],
+                outputs=[_Socket("Texture out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type == "OctaneCinema4DNoise":
+            node = _Node(
+                "Cinema 4D noise",
+                type,
+                inputs=[
+                    _Socket("Power", 1.0),
+                    _Socket("Noise type", "Box"),
+                    _Socket("Octaves", 5.0),
+                    _Socket("Lacunarity", 2.1),
+                    _Socket("Gain", 0.25),
+                    _Socket("UVW transform", None),
+                    _Socket("Projection", None),
+                    _Socket("T", 0.0),
+                    _Socket("Use 4D noise", False),
+                ],
+                outputs=[_Socket("Texture out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in ("Octane3DTransformation", "ShaderNodeOct3DTransform"):
+            node = _Node(
+                "3D transformation",
+                type,
+                inputs=[
+                    _Socket("Rotation order", "XYZ"),
+                    _Socket("Translation", (0.0, 0.0, 0.0)),
+                    _Socket("Rotation", (0.0, 0.0, 0.0)),
+                    _Socket("Scale", (1.0, 1.0, 1.0)),
+                ],
+                outputs=[_Socket("Transform out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type == "OctaneXYZToUVW":
+            node = _Node(
+                "XYZ to UVW Projection",
+                type,
+                inputs=[_Socket("Coordinate space", "World space")],
+                outputs=[_Socket("Projection out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
         if type == "ShaderNodeOutputMaterial":
             node = _Node(
                 "Material Output",
@@ -565,6 +705,111 @@ class ShadingIntentTests(unittest.TestCase):
                     _Socket("Displacement", None),
                 ],
             )
+        )
+
+    def test_coordinate_source_traces_through_mapping_and_nested_group(self) -> None:
+        coordinates = _attach_sockets(
+            _Node(
+                "Coordinates",
+                "ShaderNodeTexCoord",
+                outputs=[_Socket("Generated"), _Socket("Object")],
+            )
+        )
+        group_input = _attach_sockets(
+            _Node(
+                "Group Input",
+                "NodeGroupInput",
+                outputs=[_Socket("Vector")],
+            )
+        )
+        mapping = _attach_sockets(
+            _Node(
+                "Mapping",
+                "ShaderNodeMapping",
+                inputs=[_Socket("Vector")],
+                outputs=[_Socket("Vector")],
+            )
+        )
+        group_output = _attach_sockets(
+            _Node(
+                "Group Output",
+                "NodeGroupOutput",
+                inputs=[_Socket("Vector")],
+            )
+        )
+        internal_links = _Links()
+        internal_links.new(group_input.outputs[0], mapping.inputs[0])
+        internal_links.new(mapping.outputs[0], group_output.inputs[0])
+        group_tree = SimpleNamespace(
+            nodes=[group_input, mapping, group_output],
+            links=internal_links,
+        )
+        group = _attach_sockets(
+            _Node(
+                "Coordinate Group",
+                "ShaderNodeGroup",
+                inputs=[_Socket("Vector")],
+                outputs=[_Socket("Vector")],
+            )
+        )
+        group.node_tree = group_tree
+        noise = _attach_sockets(
+            _Node(
+                "Noise",
+                "ShaderNodeTexNoise",
+                inputs=[_Socket("Vector"), _Socket("Scale", 5.0)],
+                outputs=[_Socket("Fac")],
+            )
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[_Socket("Base Color")],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(coordinates.outputs.get("Generated"), group.inputs[0])
+        links.new(group.outputs[0], noise.inputs.get("Vector"))
+        links.new(noise.outputs[0], shader.inputs[0])
+        links.new(shader.outputs[0], output.inputs.get("Surface"))
+
+        intent = trace_shading_intent(output)
+
+        self.assertEqual(
+            intent.coordinate_sources_for(noise),
+            {CoordinateSource.GENERATED},
+        )
+
+    def test_unlinked_procedural_vector_is_implicit_generated(self) -> None:
+        noise = _attach_sockets(
+            _Node(
+                "Noise",
+                "ShaderNodeTexNoise",
+                inputs=[_Socket("Vector"), _Socket("Scale", 5.0)],
+                outputs=[_Socket("Fac")],
+            )
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[_Socket("Roughness")],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(noise.outputs[0], shader.inputs[0])
+        links.new(shader.outputs[0], output.inputs.get("Surface"))
+
+        intent = trace_shading_intent(output)
+
+        self.assertEqual(
+            intent.coordinate_sources_for(noise),
+            {CoordinateSource.GENERATED},
         )
 
     def test_roles_are_per_output_and_per_path(self) -> None:
@@ -1700,6 +1945,109 @@ class SocketResolutionTests(unittest.TestCase):
         )
         self.assertEqual(len(mapping.inputs.get("Rotation order").links), 0)
 
+    def test_mapping_and_coordinates_use_separate_c4d_noise_pins(self) -> None:
+        coordinates = _attach_sockets(
+            _Node(
+                "Coordinates",
+                "OctaneMeshUVProjection",
+                outputs=[_Socket("OutProjection")],
+            )
+        )
+        mapping = _attach_sockets(
+            _Node(
+                "Mapping",
+                "Octane3DTransformation",
+                outputs=[_Socket("OutTransform")],
+            )
+        )
+        noise = _Nodes().new("OctaneCinema4DNoise")
+        tree = SimpleNamespace(
+            name="Mapped C4D Noise",
+            nodes=_Nodes([coordinates, mapping, noise]),
+            links=_Links(),
+        )
+        analysis = SimpleNamespace(
+            nodes={
+                "Coordinates": _node_info("ShaderNodeTexCoord"),
+                "Mapping": _node_info("ShaderNodeMapping"),
+                "Noise": _node_info("ShaderNodeTexNoise"),
+            },
+            links=[
+                _link(
+                    "Coordinates",
+                    "Mapping",
+                    from_socket="Generated",
+                    to_socket="Vector",
+                ),
+                _link(
+                    "Mapping",
+                    "Noise",
+                    from_socket="Vector",
+                    to_socket="Vector",
+                ),
+            ],
+        )
+
+        _rebuild_links(
+            analysis,
+            {"Coordinates": coordinates, "Mapping": mapping, "Noise": noise},
+            tree,
+        )
+
+        self.assertIs(
+            noise.inputs.get("Projection").links[0].from_node,
+            coordinates,
+        )
+        self.assertIs(
+            noise.inputs.get("UVW transform").links[0].from_node,
+            mapping,
+        )
+
+    def test_driven_c4d_scale_is_not_misrouted_to_an_unrelated_pin(self) -> None:
+        source = _attach_sockets(
+            _Node(
+                "Scale Driver",
+                "OctaneFloatValue",
+                outputs=[_Socket("Value out")],
+            )
+        )
+        noise = _Nodes().new("OctaneCinema4DNoise")
+        tree = SimpleNamespace(
+            name="Driven C4D Scale",
+            nodes=_Nodes([source, noise]),
+            links=_Links(),
+        )
+        analysis = SimpleNamespace(
+            nodes={
+                "Scale Driver": _node_info("ShaderNodeValue"),
+                "Noise": _node_info("ShaderNodeTexNoise"),
+            },
+            links=[
+                _link(
+                    "Scale Driver",
+                    "Noise",
+                    from_socket="Value",
+                    to_socket="Scale",
+                ),
+            ],
+        )
+        report_data.clear()
+
+        _rebuild_links(
+            analysis,
+            {"Scale Driver": source, "Noise": noise},
+            tree,
+        )
+
+        self.assertFalse(any(socket.links for socket in noise.inputs))
+        self.assertTrue(
+            any(
+                "driven Scale cannot be preserved dynamically" in message
+                for message in report_data.approximations
+            )
+        )
+        report_data.clear()
+
 
 class ModernOctaneNodeTests(unittest.TestCase):
     def test_modern_material_nodes_are_preferred_over_legacy_ids(self) -> None:
@@ -1718,6 +2066,27 @@ class ModernOctaneNodeTests(unittest.TestCase):
             "OctaneColorCorrection",
         )
         self.assertNotIn("ShaderNodeRGBCurves", NODE_TYPE_MAP)
+
+    def test_phase4_native_nodes_precede_legacy_fallbacks(self) -> None:
+        for cycles_type in (
+            "ShaderNodeTexNoise",
+            "ShaderNodeTexVoronoi",
+            "ShaderNodeTexMusgrave",
+        ):
+            with self.subTest(cycles_type=cycles_type):
+                self.assertEqual(
+                    NODE_TYPE_MAP[cycles_type][0],
+                    "OctaneCinema4DNoise",
+                )
+        self.assertEqual(
+            NODE_TYPE_MAP["ShaderNodeTexWhiteNoise"][0],
+            "ShaderNodeOctNoiseTex",
+        )
+        for cycles_type in ("ShaderNodeMixRGB", "ShaderNodeMix"):
+            with self.subTest(cycles_type=cycles_type):
+                candidates = NODE_TYPE_MAP[cycles_type]
+                self.assertEqual(candidates[0], "OctaneCompositeTexture")
+                self.assertIn("OctaneCyclesMixColorNodeWrapper", candidates)
 
     def test_rgb_curve_creates_color_correction_without_unsupported_fallback(self) -> None:
         info = SimpleNamespace(
@@ -1748,6 +2117,271 @@ class ModernOctaneNodeTests(unittest.TestCase):
             any("cannot preserve arbitrary curves" in message
                 for message in report_data.approximations)
         )
+
+
+class CompositeTextureTests(unittest.TestCase):
+    @staticmethod
+    def _mix_info() -> SimpleNamespace:
+        return SimpleNamespace(
+            bl_idname="ShaderNodeMixRGB",
+            label="Multiply Layers",
+            location=(100.0, 200.0),
+            inputs={
+                "Fac": 0.25,
+                "Color1": (0.8, 0.4, 0.2, 1.0),
+                "Color2": (0.2, 0.5, 0.9, 1.0),
+            },
+            input_identifiers={
+                "Fac": "Fac",
+                "Color1": "Color1",
+                "Color2": "Color2",
+            },
+            properties={"blend_type": "MULTIPLY", "use_clamp": True},
+        )
+
+    def test_multiply_mix_builds_and_configures_two_composite_layers(self) -> None:
+        info = self._mix_info()
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Mix", info),)),
+            links=[],
+        )
+        tree = SimpleNamespace(
+            name="Composite Test",
+            nodes=_Nodes(),
+            links=_Links(),
+        )
+        engine = GraphEngine(analysis)
+
+        node_map = engine.create_nodes(tree)
+        variants = engine.created_nodes_for("Mix", node_map)
+        for node in variants:
+            _transfer_mix_rgb(info, node)
+
+        self.assertEqual(len(variants), 3)
+        composite = node_map["Mix"]
+        base = next(node for node in variants if node.get("octanify_mix_layer") == "base")
+        blend = next(node for node in variants if node.get("octanify_mix_layer") == "blend")
+        self.assertEqual(composite.bl_idname, "OctaneCompositeTexture")
+        self.assertTrue(composite.inputs.get("Clamp").default_value)
+        self.assertEqual(base.inputs.get("Blend mode").default_value, "Mix|Normal")
+        self.assertEqual(base.inputs.get("Opacity").default_value, 1.0)
+        self.assertEqual(
+            blend.inputs.get("Blend mode").default_value,
+            "Blend|Multiply",
+        )
+        self.assertEqual(blend.inputs.get("Opacity").default_value, 0.25)
+        self.assertIs(
+            composite.inputs.get("Layer 1").links[0].from_node,
+            base,
+        )
+        self.assertIs(
+            composite.inputs.get("Layer 2").links[0].from_node,
+            blend,
+        )
+        self.assertEqual(
+            base.inputs.get("Input").links[0].from_node.a_value,
+            (0.8, 0.4, 0.2),
+        )
+        self.assertEqual(
+            blend.inputs.get("Input").links[0].from_node.a_value,
+            (0.2, 0.5, 0.9),
+        )
+
+        source = _attach_sockets(
+            _Node("Source", "OctaneRGBColor", outputs=[_Socket("Texture out")])
+        )
+        node_map["Source"] = source
+        base_pair = engine.link_node_pairs(
+            _link("Source", "Mix", to_socket="Color1"),
+            node_map,
+        )
+        blend_pair = engine.link_node_pairs(
+            _link("Source", "Mix", to_socket="Color2"),
+            node_map,
+        )
+        opacity_pair = engine.link_node_pairs(
+            _link("Source", "Mix", to_socket="Fac"),
+            node_map,
+        )
+        self.assertIs(base_pair[0][1], base)
+        self.assertIs(blend_pair[0][1], blend)
+        self.assertIs(opacity_pair[0][1], blend)
+
+    def test_missing_composite_layers_uses_legacy_mix_transactionally(self) -> None:
+        class NoCompositeLayers(_Nodes):
+            def new(self, type: str):
+                if type in (
+                    "OctaneTexLayerTexture",
+                    "OctaneCompositeTextureLayer",
+                ):
+                    raise RuntimeError("layer unavailable")
+                return super().new(type)
+
+        info = self._mix_info()
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Mix", info),)),
+            links=[],
+        )
+        tree = SimpleNamespace(
+            name="Legacy Mix Test",
+            nodes=NoCompositeLayers(),
+            links=_Links(),
+        )
+
+        node_map = GraphEngine(analysis).create_nodes(tree)
+
+        self.assertEqual(
+            node_map["Mix"].bl_idname,
+            "OctaneCyclesMixColorNodeWrapper",
+        )
+        self.assertFalse(
+            any(node.bl_idname == "OctaneCompositeTexture" for node in tree.nodes)
+        )
+
+    def test_non_color_shader_mix_keeps_legacy_mix_target(self) -> None:
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeMix",
+            label="Float Mix",
+            location=(0.0, 0.0),
+            inputs={"Factor": 0.5, "A": 0.25, "B": 0.75},
+            input_identifiers={
+                "Factor": "Factor",
+                "A": "A",
+                "B": "B",
+            },
+            properties={"blend_type": "MIX", "data_type": "FLOAT"},
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Mix", info),)),
+            links=[],
+        )
+        tree = SimpleNamespace(
+            name="Float Mix Test",
+            nodes=_Nodes(),
+            links=_Links(),
+        )
+
+        node_map = GraphEngine(analysis).create_nodes(tree)
+
+        self.assertEqual(
+            node_map["Mix"].bl_idname,
+            "OctaneCyclesMixFloatNodeWrapper",
+        )
+        self.assertFalse(
+            any(node.bl_idname == "OctaneCompositeTexture" for node in tree.nodes)
+        )
+
+    def test_color_shader_mix_uses_composite_layers(self) -> None:
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeMix",
+            label="Screen Layers",
+            location=(0.0, 0.0),
+            inputs={
+                "Factor": 0.6,
+                "A": (0.1, 0.2, 0.3, 1.0),
+                "B": (0.8, 0.7, 0.6, 1.0),
+            },
+            input_identifiers={
+                "Factor": "Factor",
+                "A": "A",
+                "B": "B",
+            },
+            properties={
+                "blend_type": "SCREEN",
+                "data_type": "RGBA",
+                "clamp_result": True,
+            },
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Mix", info),)),
+            links=[],
+        )
+        tree = SimpleNamespace(
+            name="Color Mix Test",
+            nodes=_Nodes(),
+            links=_Links(),
+        )
+        engine = GraphEngine(analysis)
+
+        node_map = engine.create_nodes(tree)
+        variants = engine.created_nodes_for("Mix", node_map)
+        for node in variants:
+            _transfer_mix(info, node)
+
+        self.assertEqual(node_map["Mix"].bl_idname, "OctaneCompositeTexture")
+        blend = next(
+            node
+            for node in variants
+            if node.get("octanify_mix_layer") == "blend"
+        )
+        self.assertEqual(
+            blend.inputs.get("Blend mode").default_value,
+            "Photometric|Screen",
+        )
+        self.assertEqual(blend.inputs.get("Opacity").default_value, 0.6)
+
+    def test_color_shader_mix_reads_enabled_color_identifiers(self) -> None:
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeMix",
+            label="Typed Color Mix",
+            location=(0.0, 0.0),
+            inputs={
+                "Factor_Float": 0.4,
+                "A_Float": 0.0,
+                "B_Float": 0.0,
+                "A_Color": (0.1, 0.3, 0.5, 1.0),
+                "B_Color": (0.9, 0.7, 0.2, 1.0),
+            },
+            input_identifiers={
+                "Factor_Float": "Factor",
+                "A_Float": "A",
+                "B_Float": "B",
+                "A_Color": "A",
+                "B_Color": "B",
+            },
+            properties={"blend_type": "MIX", "data_type": "RGBA"},
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Mix", info),)),
+            links=[],
+        )
+        tree = SimpleNamespace(
+            name="Typed Color Mix Test",
+            nodes=_Nodes(),
+            links=_Links(),
+        )
+        engine = GraphEngine(analysis)
+        node_map = engine.create_nodes(tree)
+        variants = engine.created_nodes_for("Mix", node_map)
+
+        for node in variants:
+            _transfer_mix(info, node)
+
+        base = next(
+            node for node in variants
+            if node.get("octanify_mix_layer") == "base"
+        )
+        blend = next(
+            node for node in variants
+            if node.get("octanify_mix_layer") == "blend"
+        )
+        self.assertEqual(
+            base.inputs.get("Input").default_value,
+            (0.1, 0.3, 0.5, 1.0),
+        )
+        self.assertEqual(
+            blend.inputs.get("Input").default_value,
+            (0.9, 0.7, 0.2, 1.0),
+        )
+        self.assertEqual(
+            base.inputs.get("Input").links[0].from_node.a_value,
+            (0.1, 0.3, 0.5),
+        )
+        self.assertEqual(
+            blend.inputs.get("Input").links[0].from_node.a_value,
+            (0.9, 0.7, 0.2),
+        )
+        self.assertEqual(blend.inputs.get("Opacity").default_value, 0.4)
 
 
 class ContextualImageTests(unittest.TestCase):
@@ -2415,6 +3049,107 @@ class PropertyTransferTests(unittest.TestCase):
         _transfer_rgb_curve(info, node)
 
         self.assertEqual(node.inputs.get("Mask").default_value, 0.35)
+
+    def test_c4d_noise_uses_fbm_gain_and_lacunarity_parameters(self) -> None:
+        node = _Nodes().new("OctaneCinema4DNoise")
+        values = {
+            "Scale": 5.0,
+            "Detail": 7.5,
+            "Roughness": 0.65,
+            "Lacunarity": 3.25,
+            "Distortion": 0.0,
+        }
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeTexNoise",
+            inputs=values,
+            input_identifiers={name: name for name in values},
+            properties={"noise_type": "FBM", "noise_dimensions": "3D"},
+        )
+
+        _transfer_noise(info, node)
+
+        self.assertEqual(node.inputs.get("Noise type").default_value, "FBM")
+        self.assertEqual(node.inputs.get("Octaves").default_value, 7.5)
+        self.assertEqual(node.inputs.get("Gain").default_value, 0.65)
+        self.assertEqual(node.inputs.get("Lacunarity").default_value, 3.25)
+        self.assertTrue(node.inputs.get("Use 4D noise").default_value)
+
+    def test_blender_51_noise_modes_and_4d_time_are_preserved(self) -> None:
+        node = _Nodes().new("OctaneCinema4DNoise")
+        values = {
+            "Detail": 4.0,
+            "Roughness": 0.45,
+            "Lacunarity": 2.2,
+            "W": 1.75,
+            "Distortion": 0.0,
+        }
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeTexNoise",
+            inputs=values,
+            input_identifiers={name: name for name in values},
+            properties={
+                "noise_type": "RIDGED_MULTIFRACTAL",
+                "noise_dimensions": "4D",
+                "normalize": True,
+            },
+        )
+
+        _transfer_noise(info, node)
+
+        self.assertEqual(
+            node.inputs.get("Noise type").default_value,
+            "Ridged Multi Fractal",
+        )
+        self.assertTrue(node.inputs.get("Use 4D noise").default_value)
+        self.assertEqual(node.inputs.get("T").default_value, 1.75)
+
+    def test_c4d_voronoi_and_musgrave_select_native_noise_modes(self) -> None:
+        voronoi = _Nodes().new("OctaneCinema4DNoise")
+        voronoi_values = {
+            "Scale": 4.0,
+            "Detail": 3.5,
+            "Roughness": 0.7,
+            "Lacunarity": 2.75,
+            "Randomness": 1.0,
+        }
+        _transfer_voronoi(
+            SimpleNamespace(
+                inputs=voronoi_values,
+                input_identifiers={
+                    name: name for name in voronoi_values
+                },
+                properties={"feature": "F2", "voronoi_dimensions": "3D"},
+            ),
+            voronoi,
+        )
+        self.assertEqual(
+            voronoi.inputs.get("Noise type").default_value,
+            "Voronoi 2",
+        )
+        self.assertTrue(voronoi.inputs.get("Use 4D noise").default_value)
+        self.assertEqual(voronoi.inputs.get("Octaves").default_value, 3.5)
+        self.assertEqual(voronoi.inputs.get("Gain").default_value, 0.7)
+        self.assertEqual(voronoi.inputs.get("Lacunarity").default_value, 2.75)
+
+        musgrave = _Nodes().new("OctaneCinema4DNoise")
+        values = {"Detail": 6.0, "Roughness": 0.4, "Lacunarity": 2.5}
+        _transfer_noise(
+            SimpleNamespace(
+                bl_idname="ShaderNodeTexMusgrave",
+                inputs=values,
+                input_identifiers={name: name for name in values},
+                properties={
+                    "musgrave_type": "RIDGED_MULTIFRACTAL",
+                    "musgrave_dimensions": "2D",
+                },
+            ),
+            musgrave,
+        )
+        self.assertEqual(
+            musgrave.inputs.get("Noise type").default_value,
+            "Ridged Multi Fractal",
+        )
+        self.assertFalse(musgrave.inputs.get("Use 4D noise").default_value)
 
     def test_standard_surface_maps_principled_layers_without_enabling_them(self) -> None:
         node = _attach_sockets(
@@ -3383,6 +4118,332 @@ class NormalFallbackTests(unittest.TestCase):
 
 
 class ScaleCorrectionTests(unittest.TestCase):
+    def test_shared_generated_material_is_specialized_per_local_bounds(self) -> None:
+        class _Material:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.node_tree = SimpleNamespace(nodes=[])
+                self.users = 0
+
+            def copy(self):
+                return _Material(f"{self.name} copy")
+
+        material = _Material("Shared Procedural")
+
+        def obj(size: float):
+            half = size / 2.0
+            return SimpleNamespace(
+                bound_box=[(-half, -half, -half), (half, half, half)]
+            )
+
+        slots = [SimpleNamespace(material=material) for _index in range(4)]
+        work_items = [
+            (obj(1.0), material, slots[0]),
+            (obj(2.0), material, slots[1]),
+            (obj(5.0), material, slots[2]),
+            (obj(2.0), material, slots[3]),
+        ]
+
+        with patch(
+            "octanify.core.conversion_engine._material_uses_generated_scale_matching",
+            return_value=True,
+        ):
+            specialized, copies = _specialize_bbox_relative_materials(work_items)
+
+        self.assertIs(specialized[0][1], material)
+        self.assertIsNot(specialized[1][1], material)
+        self.assertIsNot(specialized[2][1], material)
+        self.assertIs(specialized[1][1], specialized[3][1])
+        self.assertEqual(len(copies), 2)
+
+    def test_geometry_nodes_bounds_conflict_is_reported_without_rewrite(self) -> None:
+        material = SimpleNamespace(name="GN Procedural", node_tree=None)
+        first = SimpleNamespace(bound_box=[(-0.5,) * 3, (0.5,) * 3])
+        second = SimpleNamespace(bound_box=[(-2.5,) * 3, (2.5,) * 3])
+
+        with patch(
+            "octanify.core.conversion_engine._material_uses_generated_scale_matching",
+            return_value=True,
+        ):
+            specialized, copies = _specialize_bbox_relative_materials(
+                [(first, material, None), (second, material, None)]
+            )
+
+        self.assertEqual(
+            [entry[1] for entry in specialized],
+            [material, material],
+        )
+        self.assertEqual(copies, [])
+        self.assertTrue(
+            any(
+                "Geometry Nodes shares this Generated-coordinate material"
+                in message
+                for message in report_data.approximations
+            )
+        )
+
+    @staticmethod
+    def _procedural_fixture(cycles_type: str, coordinate_name: str = "Generated"):
+        coordinates = _attach_sockets(
+            _Node(
+                "Coordinates",
+                "ShaderNodeTexCoord",
+                outputs=[_Socket("Generated"), _Socket("Object"), _Socket("UV")],
+            )
+        )
+        output_name = "Distance" if cycles_type == "ShaderNodeTexVoronoi" else "Fac"
+        procedural = _attach_sockets(
+            _Node(
+                "Procedural",
+                cycles_type,
+                inputs=[_Socket("Vector"), _Socket("Scale", 5.0)],
+                outputs=[_Socket(output_name)],
+            )
+        )
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[_Socket("Roughness", 0.5)],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface"), _Socket("Displacement")],
+            )
+        )
+        links = _Links()
+        links.new(
+            coordinates.outputs.get(coordinate_name),
+            procedural.inputs.get("Vector"),
+        )
+        links.new(procedural.outputs[0], shader.inputs[0])
+        links.new(shader.outputs[0], output.inputs.get("Surface"))
+        source_tree = SimpleNamespace(
+            name="Scale Source",
+            nodes=_Nodes([coordinates, procedural, shader, output]),
+            links=links,
+        )
+        info = SimpleNamespace(
+            bl_idname=cycles_type,
+            label="Procedural",
+            location=(100.0, 200.0),
+            inputs={"Scale": 5.0},
+            input_identifiers={"Scale": "Scale"},
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Procedural", info),)),
+            links=[],
+        )
+        return source_tree, procedural, output, analysis
+
+    def test_noise_voronoi_and_musgrave_match_one_two_and_five_meter_bounds(self) -> None:
+        for cycles_type in (
+            "ShaderNodeTexNoise",
+            "ShaderNodeTexVoronoi",
+            "ShaderNodeTexMusgrave",
+        ):
+            for size in (1.0, 2.0, 5.0):
+                with self.subTest(cycles_type=cycles_type, size=size):
+                    source_tree, _procedural, output, analysis = (
+                        self._procedural_fixture(cycles_type)
+                    )
+                    intent = trace_shading_intent(output)
+                    octane_noise = _Nodes().new("OctaneCinema4DNoise")
+                    target_tree = SimpleNamespace(
+                        name="Scale Target",
+                        nodes=_Nodes([octane_noise]),
+                        links=_Links(),
+                    )
+                    half = size / 2.0
+                    obj = SimpleNamespace(
+                        name=f"{size:g}m Cube",
+                        bound_box=[
+                            (-half, -half, -half),
+                            (half, half, half),
+                        ],
+                    )
+
+                    _apply_scale_correction(
+                        obj,
+                        {"Procedural": octane_noise},
+                        analysis,
+                        intent_map=intent,
+                        source_tree=source_tree,
+                        target_tree=target_tree,
+                    )
+
+                    transform = next(
+                        node for node in target_tree.nodes
+                        if node.bl_idname == "Octane3DTransformation"
+                    )
+                    projection = next(
+                        node for node in target_tree.nodes
+                        if node.bl_idname == "OctaneXYZToUVW"
+                    )
+                    expected = (0.5 * size / 5.0,) * 3
+                    self.assertEqual(
+                        transform.inputs.get("Scale").default_value,
+                        expected,
+                    )
+                    self.assertEqual(
+                        transform.inputs.get("Translation").default_value,
+                        (-half, -half, -half),
+                    )
+                    self.assertEqual(
+                        projection.inputs.get("Coordinate space").default_value,
+                        "Object space",
+                    )
+                    self.assertIs(
+                        octane_noise.inputs.get("UVW transform").links[0].from_node,
+                        transform,
+                    )
+                    self.assertIs(
+                        octane_noise.inputs.get("Projection").links[0].from_node,
+                        projection,
+                    )
+
+    def test_object_coordinates_receive_inverse_logical_scale(self) -> None:
+        source_tree, _procedural, output, analysis = self._procedural_fixture(
+            "ShaderNodeTexNoise",
+            coordinate_name="Object",
+        )
+        intent = trace_shading_intent(output)
+        octane_noise = _Nodes().new("OctaneCinema4DNoise")
+        target_tree = SimpleNamespace(
+            name="Object Scale Target",
+            nodes=_Nodes([octane_noise]),
+            links=_Links(),
+        )
+
+        _apply_scale_correction(
+            SimpleNamespace(
+                name="Object Cube",
+                bound_box=[(-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)],
+            ),
+            {"Procedural": octane_noise},
+            analysis,
+            intent_map=intent,
+            source_tree=source_tree,
+            target_tree=target_tree,
+        )
+
+        transform = next(
+            node for node in target_tree.nodes
+            if node.bl_idname == "Octane3DTransformation"
+        )
+        self.assertEqual(
+            transform.inputs.get("Scale").default_value,
+            (0.1, 0.1, 0.1),
+        )
+
+    def test_generated_point_mapping_scale_is_composed_instead_of_squared(self) -> None:
+        source_tree, procedural, output, procedural_analysis = (
+            self._procedural_fixture("ShaderNodeTexNoise")
+        )
+        intent = trace_shading_intent(output)
+        mapping_info = SimpleNamespace(
+            bl_idname="ShaderNodeMapping",
+            label="Mapping",
+            location=(0.0, 0.0),
+            inputs={
+                "Location": (0.25, 0.0, 0.0),
+                "Rotation": (0.0, 0.0, 0.0),
+                "Scale": (2.0, 2.0, 2.0),
+            },
+            input_identifiers={
+                "Location": "Location",
+                "Rotation": "Rotation",
+                "Scale": "Scale",
+            },
+            properties={"vector_type": "POINT"},
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((
+                ("Mapping", mapping_info),
+                ("Procedural", procedural_analysis.nodes["Procedural"]),
+            )),
+            links=[],
+        )
+        mapped_transform = _Nodes().new("Octane3DTransformation")
+        mapped_transform.inputs.get("Scale").default_value = (2.0, 2.0, 2.0)
+        mapped_transform.inputs.get("Translation").default_value = (0.25, 0.0, 0.0)
+        octane_noise = _Nodes().new("OctaneCinema4DNoise")
+        target_tree = SimpleNamespace(
+            name="Mapped Generated Target",
+            nodes=_Nodes([mapped_transform, octane_noise]),
+            links=_Links(),
+        )
+        target_tree.links.new(
+            mapped_transform.outputs[0],
+            octane_noise.inputs.get("UVW transform"),
+        )
+
+        _apply_scale_correction(
+            SimpleNamespace(
+                name="2m Cube",
+                bound_box=[(-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)],
+            ),
+            {"Mapping": mapped_transform, "Procedural": octane_noise},
+            analysis,
+            intent_map=intent,
+            source_tree=source_tree,
+            target_tree=target_tree,
+        )
+
+        corrected = next(
+            node for node in target_tree.nodes
+            if node.get("octanify_scale_correction")
+        )
+        self.assertEqual(
+            corrected.inputs.get("Scale").default_value,
+            (0.1, 0.1, 0.1),
+        )
+        self.assertEqual(
+            corrected.inputs.get("Translation").default_value,
+            (-1.25, -1.0, -1.0),
+        )
+
+    def test_uv_procedural_coordinates_keep_logical_scale_without_bbox_division(self) -> None:
+        source_tree, _procedural, output, analysis = self._procedural_fixture(
+            "ShaderNodeTexNoise",
+            coordinate_name="UV",
+        )
+        intent = trace_shading_intent(output)
+        octane_noise = _Nodes().new("OctaneCinema4DNoise")
+        target_tree = SimpleNamespace(
+            name="UV Scale Target",
+            nodes=_Nodes([octane_noise]),
+            links=_Links(),
+        )
+
+        _apply_scale_correction(
+            SimpleNamespace(
+                name="UV Cube",
+                bound_box=[(-2.5, -2.5, -2.5), (2.5, 2.5, 2.5)],
+            ),
+            {"Procedural": octane_noise},
+            analysis,
+            intent_map=intent,
+            source_tree=source_tree,
+            target_tree=target_tree,
+        )
+
+        transform = next(
+            node for node in target_tree.nodes
+            if node.bl_idname == "Octane3DTransformation"
+        )
+        self.assertEqual(
+            transform.inputs.get("Scale").default_value,
+            (0.1, 0.1, 0.1),
+        )
+        self.assertFalse(
+            any(node.bl_idname == "OctaneXYZToUVW" for node in target_tree.nodes)
+        )
+
     def test_uv_mapping_is_not_modified_by_object_scale(self) -> None:
         mapping = _attach_sockets(
             _Node(

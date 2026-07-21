@@ -35,7 +35,12 @@ from .node_registry import (
 )
 from .gamma_system import apply_gamma
 from .geonodes_scan import collect_geometry_node_materials
-from .shading_intent import Role, ShadingIntentMap, trace_shading_intent
+from .shading_intent import (
+    CoordinateSource,
+    Role,
+    ShadingIntentMap,
+    trace_shading_intent,
+)
 from .layout_engine import style_converted_graph, style_smart_graphs
 from .volumetric_handler import handle_volumetrics
 from .report import report_data
@@ -142,6 +147,16 @@ def _group_intent_signature(
                 ",".join(sorted(role.value for role in roles)),
             ))
         )
+    for node, sources in intent_map.coordinate_sources.items():
+        if _rna_identity(node) not in node_ids:
+            continue
+        parts.append(
+            "coordinates:"
+            + ":".join((
+                getattr(node, "name", ""),
+                ",".join(sorted(source.value for source in sources)),
+            ))
+        )
     payload = "|".join(sorted(parts)).encode("utf-8")
     return hashlib.sha1(payload).hexdigest()[:12]
 
@@ -185,6 +200,18 @@ def _maybe_report_socket_mismatch(
 # ---------------------------------------------------------------------------
 
 _COORDINATE_NODE_TYPES = {"ShaderNodeTexCoord", "ShaderNodeUVMap"}
+_C4D_PROCEDURAL_TYPES = {
+    "ShaderNodeTexNoise",
+    "ShaderNodeTexVoronoi",
+    "ShaderNodeTexMusgrave",
+}
+_C4D_LINKABLE_INPUTS = {
+    "Vector",
+    "Detail",
+    "Roughness",
+    "Lacunarity",
+    "W",
+}
 
 
 def _first_named_socket(collection, *names: str):
@@ -211,6 +238,7 @@ def _contextual_vector_input(
     if from_type == "ShaderNodeMapping":
         return _first_named_socket(
             octane_node.inputs,
+            "UVW transform",
             "UV transform",
             "Transform",
             "UVTransform",
@@ -489,6 +517,23 @@ def _rebuild_links(
                 continue
 
         for oct_from, oct_to in oct_pairs:
+            if (
+                to_type in _C4D_PROCEDURAL_TYPES
+                and getattr(oct_to, "bl_idname", "") == "OctaneCinema4DNoise"
+                and to_sock_name not in _C4D_LINKABLE_INPUTS
+            ):
+                if to_sock_name == "Scale":
+                    detail = (
+                        "is baked into the generated UVW transform; a driven "
+                        "Scale cannot be preserved dynamically"
+                    )
+                else:
+                    detail = "has no compatible Cinema 4D Noise input"
+                report_data.add_approximation(
+                    f"[{target_tree.name}] {to_name}.{to_sock_name} {detail}"
+                )
+                continue
+
             # Resolve the output per treatment pair: mixed-intent links may
             # originate from different duplicated nodes.
             out_socket = resolve_output_socket(
@@ -1896,61 +1941,391 @@ def _find_input_socket_by_name(
 # ---------------------------------------------------------------------------
 
 def _apply_scale_correction(
-    obj: bpy.types.Object,
+    obj: bpy.types.Object | None,
     node_map: dict[str, bpy.types.Node],
     analysis: TreeAnalysis,
+    intent_map: ShadingIntentMap | None = None,
+    source_tree: bpy.types.NodeTree | None = None,
+    target_tree: bpy.types.NodeTree | None = None,
 ) -> None:
-    """Apply scale compensation for object scale and coordinate differences."""
-    if obj is None:
+    """Match Cycles' bounding-box-relative procedural texture period.
+
+    Generated coordinates are normalized across the local bounding box before
+    Cycles applies a procedural node's logical Scale.  Octane evaluates a 3D
+    procedural with the inverse UVW transform, so the equivalent transform is
+    ``local_bbox_extent / logical_scale`` with the bounding-box minimum as its
+    origin.  Object and UV coordinates are already unnormalized and therefore
+    use ``1 / logical_scale`` without the bounding-box correction.  Cinema 4D
+    Noise has half the spatial frequency at a unit transform, measured against
+    Cycles Noise in Blender 5.1 + Octane 31.9, so its transform scale receives
+    an additional 0.5 factor.
+    """
+    if intent_map is None or target_tree is None:
         return
 
-    obj_scale = obj.scale
-    if (abs(obj_scale.x - 1.0) < 0.001
-            and abs(obj_scale.y - 1.0) < 0.001
-            and abs(obj_scale.z - 1.0) < 0.001):
-        return  # No correction needed
-
-    # Find mapping / transform nodes and adjust their scale
-    for node_name, info in analysis.nodes.items():
-        if info.bl_idname != "ShaderNodeMapping":
-            continue
-
-        # UV coordinates are already object-scale independent in both
-        # renderers.  Applying object scale to every Mapping node distorts UV
-        # materials, so compensate only for coordinate spaces whose values
-        # are derived from object/generated bounds.
-        needs_object_scale = False
-        for link_info in analysis.links:
-            if (link_info.to_node != node_name
-                    or link_info.to_socket != "Vector"):
-                continue
-            source_info = analysis.nodes.get(link_info.from_node)
-            if (source_info is not None
-                    and source_info.bl_idname == "ShaderNodeTexCoord"
-                    and link_info.from_socket in ("Generated", "Object")):
-                needs_object_scale = True
-                break
-        if not needs_object_scale:
-            continue
-
-        oct_node = node_map.get(node_name)
-        if oct_node is None:
-            continue
-
-        # Try to find and adjust the Scale input
-        scale_sock = oct_node.inputs.get("Scale") or oct_node.inputs.get("Scaling")
-        if scale_sock is not None and hasattr(scale_sock, "default_value"):
-            try:
-                current = list(scale_sock.default_value)
-                current[0] *= obj_scale.x
-                current[1] *= obj_scale.y
-                current[2] *= obj_scale.z
-                scale_sock.default_value = current
-                report_data.add_approximation(
-                    f"Applied object-scale compensation to Mapping node '{node_name}'"
+    dimensions = None
+    bbox_minima = None
+    bounds = list(getattr(obj, "bound_box", ()) or ()) if obj is not None else []
+    if bounds:
+        try:
+            minima = [
+                min(float(point[axis]) for point in bounds)
+                for axis in range(3)
+            ]
+            maxima = [
+                max(float(point[axis]) for point in bounds)
+                for axis in range(3)
+            ]
+            candidate_dimensions = [
+                maximum - minimum
+                for minimum, maximum in zip(minima, maxima)
+            ]
+            if all(dimension > 1.0e-8 for dimension in candidate_dimensions):
+                dimensions = candidate_dimensions
+                bbox_minima = minima
+            else:
+                report_data.add_warning(
+                    f"[{getattr(obj, 'name', 'Object')}] Bounding-box scale "
+                    "matching skipped because a local axis has zero length"
                 )
-            except (TypeError, IndexError):
+        except (IndexError, TypeError, ValueError):
+            dimensions = None
+
+    procedural_types = {
+        "ShaderNodeTexNoise",
+        "ShaderNodeTexVoronoi",
+        "ShaderNodeTexMusgrave",
+    }
+
+    def input_value(info, name: str, default: float) -> float:
+        value = info.inputs.get(name)
+        if value is None:
+            for identifier, display_name in info.input_identifiers.items():
+                if display_name == name:
+                    value = info.inputs.get(identifier)
+                    break
+        try:
+            return float(default if value is None else value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def input_vector(
+        info,
+        name: str,
+        default: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        value = info.inputs.get(name)
+        if value is None:
+            for identifier, display_name in info.input_identifiers.items():
+                if display_name == name:
+                    value = info.inputs.get(identifier)
+                    break
+        try:
+            values = tuple(float(component) for component in value)
+        except (TypeError, ValueError):
+            return default
+        return values[:3] if len(values) >= 3 else default
+
+    def source_node(node_name: str):
+        if source_tree is None:
+            return None
+        getter = getattr(source_tree.nodes, "get", None)
+        if callable(getter):
+            found = getter(node_name)
+            if found is not None:
+                return found
+        return next(
+            (
+                node for node in source_tree.nodes
+                if getattr(node, "name", "") == node_name
+            ),
+            None,
+        )
+
+    def first_input(node, names: tuple[str, ...]):
+        return next(
+            (socket for name in names if (socket := node.inputs.get(name)) is not None),
+            None,
+        )
+
+    def copy_transform_inputs(source, destination) -> None:
+        if source is None:
+            return
+        for name in ("Rotation order", "Translation", "Rotation", "Scale"):
+            source_socket = source.inputs.get(name)
+            destination_socket = destination.inputs.get(name)
+            if source_socket is None or destination_socket is None:
+                continue
+            try:
+                destination_socket.default_value = source_socket.default_value
+            except (AttributeError, TypeError):
                 pass
+
+    for node_name, info in analysis.nodes.items():
+        if info.bl_idname not in procedural_types:
+            continue
+        original_node = source_node(node_name)
+        if original_node is None:
+            continue
+        coordinate_sources = intent_map.coordinate_sources_for(original_node)
+        matched_sources = coordinate_sources & {
+            CoordinateSource.GENERATED,
+            CoordinateSource.OBJECT,
+        }
+        uses_generated = CoordinateSource.GENERATED in matched_sources
+
+        octane_node = node_map.get(node_name)
+        if octane_node is None:
+            continue
+        is_c4d_noise = (
+            getattr(octane_node, "bl_idname", "") == "OctaneCinema4DNoise"
+        )
+        if not matched_sources and not is_c4d_noise:
+            continue
+        transform_input = first_input(
+            octane_node,
+            ("UVW transform", "UV transform", "Transform", "UVTransform"),
+        )
+        projection_input = first_input(octane_node, ("Projection",))
+        needs_object_projection = bool(matched_sources)
+        if (
+            transform_input is None
+            or (needs_object_projection and projection_input is None)
+        ):
+            report_data.add_approximation(
+                f"[{target_tree.name}] '{node_name}' uses object-relative "
+                "coordinates, but its Octane fallback has no transform/projection pair"
+            )
+            continue
+
+        previous_transform_links = [
+            link.from_socket for link in list(getattr(transform_input, "links", ()))
+        ]
+        previous_projection_links = (
+            [
+                link.from_socket
+                for link in list(getattr(projection_input, "links", ()))
+            ]
+            if projection_input is not None
+            else []
+        )
+        previous_transform = (
+            transform_input.links[0].from_node
+            if getattr(transform_input, "links", None)
+            else None
+        )
+        mapping_info = next(
+            (
+                analysis.nodes.get(source_name)
+                for source_name, mapped_node in node_map.items()
+                if previous_transform is not None
+                and _rna_identity(mapped_node) == _rna_identity(previous_transform)
+                and getattr(analysis.nodes.get(source_name), "bl_idname", "")
+                == "ShaderNodeMapping"
+            ),
+            None,
+        )
+        created_nodes = []
+        transform = create_node_from_candidates(
+            target_tree,
+            ("Octane3DTransformation", "ShaderNodeOct3DTransform"),
+            label=f"{info.label} [Scale Match]",
+        )
+        projection = (
+            create_node_from_candidates(
+                target_tree,
+                ("OctaneXYZToUVW",),
+                label=f"{info.label} [Object Coordinates]",
+            )
+            if needs_object_projection
+            else None
+        )
+        if transform is not None:
+            created_nodes.append(transform)
+        if projection is not None:
+            created_nodes.append(projection)
+        if transform is None or (needs_object_projection and projection is None):
+            for created in created_nodes:
+                try:
+                    target_tree.nodes.remove(created)
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+            report_data.add_warning(
+                f"[{target_tree.name}] Could not create procedural scale "
+                f"correction nodes for '{node_name}'"
+            )
+            continue
+
+        transform.location = (
+            info.location[0] - 380,
+            info.location[1] - 120,
+        )
+        if projection is not None:
+            projection.location = (
+                info.location[0] - 380,
+                info.location[1] + 120,
+            )
+        copy_transform_inputs(previous_transform, transform)
+        logical_scale = input_value(info, "Scale", 5.0)
+        scale_socket = first_input(transform, ("Scale", "Scaling"))
+        base_scale = (1.0, 1.0, 1.0)
+        if scale_socket is not None:
+            try:
+                current = tuple(scale_socket.default_value)
+                if len(current) >= 3:
+                    base_scale = tuple(float(value) for value in current[:3])
+            except (AttributeError, TypeError, ValueError):
+                pass
+            mapping_type = (
+                getattr(mapping_info, "properties", {}).get(
+                    "vector_type", "POINT"
+                )
+                if mapping_info is not None
+                else ""
+            )
+            mapping_scale = (
+                input_vector(mapping_info, "Scale", (1.0, 1.0, 1.0))
+                if mapping_info is not None
+                else (1.0, 1.0, 1.0)
+            )
+            if mapping_type in {"POINT", "VECTOR"}:
+                base_scale = tuple(
+                    1.0 / value if abs(value) > 1.0e-8 else 1.0e8
+                    for value in mapping_scale
+                )
+            if abs(logical_scale) <= 1.0e-8:
+                correction = (1.0e8, 1.0e8, 1.0e8)
+                report_data.add_approximation(
+                    f"[{target_tree.name}] '{node_name}' uses a zero procedural "
+                    "Scale; approximated it with a very large Octane transform"
+                )
+            elif uses_generated and dimensions is not None:
+                correction = tuple(
+                    dimension / logical_scale for dimension in dimensions
+                )
+            else:
+                correction = (1.0 / logical_scale,) * 3
+            if is_c4d_noise:
+                correction = tuple(0.5 * value for value in correction)
+            try:
+                scale_socket.default_value = tuple(
+                    base * factor
+                    for base, factor in zip(base_scale, correction)
+                )
+            except (AttributeError, TypeError):
+                pass
+        translation_socket = first_input(transform, ("Translation",))
+        if translation_socket is not None:
+            translation = None
+            mapping_type = (
+                getattr(mapping_info, "properties", {}).get(
+                    "vector_type", "POINT"
+                )
+                if mapping_info is not None
+                else ""
+            )
+            if mapping_info is not None:
+                mapping_location = input_vector(
+                    mapping_info, "Location", (0.0, 0.0, 0.0)
+                )
+                mapping_scale = input_vector(
+                    mapping_info, "Scale", (1.0, 1.0, 1.0)
+                )
+                if mapping_type == "POINT":
+                    mapped_translation = tuple(
+                        -location / scale if abs(scale) > 1.0e-8 else 0.0
+                        for location, scale in zip(
+                            mapping_location, mapping_scale
+                        )
+                    )
+                elif mapping_type == "TEXTURE":
+                    mapped_translation = mapping_location
+                else:
+                    mapped_translation = (0.0, 0.0, 0.0)
+                if uses_generated and bbox_minima is not None and dimensions is not None:
+                    translation = tuple(
+                        minimum + dimension * mapped
+                        for minimum, dimension, mapped in zip(
+                            bbox_minima, dimensions, mapped_translation
+                        )
+                    )
+                else:
+                    translation = mapped_translation
+                mapping_rotation = input_vector(
+                    mapping_info, "Rotation", (0.0, 0.0, 0.0)
+                )
+                if any(abs(angle) > 1.0e-8 for angle in mapping_rotation):
+                    report_data.add_approximation(
+                        f"[{target_tree.name}] '{node_name}' combines a rotated "
+                        "Cycles Mapping node with procedural scale matching; "
+                        "non-uniform bounds may require manual rotation verification"
+                    )
+            elif uses_generated and bbox_minima is not None:
+                translation = tuple(bbox_minima)
+            if translation is not None:
+                try:
+                    translation_socket.default_value = translation
+                except (AttributeError, TypeError):
+                    pass
+        coordinate_space = (
+            projection.inputs.get("Coordinate space")
+            if projection is not None
+            else None
+        )
+        if coordinate_space is not None:
+            try:
+                coordinate_space.default_value = "Object space"
+            except (AttributeError, TypeError):
+                pass
+        try:
+            for link in list(getattr(transform_input, "links", ())):
+                target_tree.links.remove(link)
+            if projection_input is not None and projection is not None:
+                for link in list(getattr(projection_input, "links", ())):
+                    target_tree.links.remove(link)
+            target_tree.links.new(transform.outputs[0], transform_input)
+            if projection is not None and projection_input is not None:
+                target_tree.links.new(projection.outputs[0], projection_input)
+            for created in created_nodes:
+                try:
+                    created["octanify_scale_correction"] = True
+                    created["octanify_source_node"] = node_name
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+            if uses_generated and dimensions is not None:
+                report_data.add_notice(
+                    f"[{target_tree.name}] Matched "
+                    f"{info.bl_idname.replace('ShaderNodeTex', '')} scale for "
+                    "Generated coordinates using bounding box "
+                    f"{tuple(round(value, 6) for value in dimensions)}"
+                )
+            elif CoordinateSource.OBJECT in matched_sources:
+                report_data.add_notice(
+                    f"[{target_tree.name}] Matched "
+                    f"{info.bl_idname.replace('ShaderNodeTex', '')} scale for "
+                    "Object coordinates"
+                )
+        except (AttributeError, IndexError, RuntimeError, TypeError) as exc:
+            for created in created_nodes:
+                try:
+                    target_tree.nodes.remove(created)
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+            for from_socket in previous_transform_links:
+                try:
+                    target_tree.links.new(from_socket, transform_input)
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+            if projection_input is not None:
+                for from_socket in previous_projection_links:
+                    try:
+                        target_tree.links.new(from_socket, projection_input)
+                    except (AttributeError, RuntimeError, TypeError):
+                        pass
+            report_data.add_warning(
+                f"[{target_tree.name}] Procedural scale correction for "
+                f"'{node_name}' was rolled back: {exc}"
+            )
 
 
 def convert_node_group(
@@ -1961,6 +2336,7 @@ def convert_node_group(
     auto_arrange: bool = True,
     # Kept after the established positional parameters for API compatibility.
     color_nodes: bool = True,
+    object_context: bpy.types.Object | None = None,
 ) -> bpy.types.NodeTree | None:
     """Convert a ShaderNodeTree used by a NodeGroup."""
     if group_tree is None:
@@ -1969,9 +2345,20 @@ def convert_node_group(
     tree_name = group_tree.name
     layout_signature = "arranged" if auto_arrange else "source_layout"
     color_signature = "colored" if color_nodes else "default_color"
+    bounds = list(getattr(object_context, "bound_box", ()) or ())
+    if bounds:
+        normalized_bounds = tuple(
+            tuple(round(float(value), 6) for value in point)
+            for point in bounds
+        )
+        bounds_signature = hashlib.sha1(
+            repr(normalized_bounds).encode("utf-8")
+        ).hexdigest()[:10]
+    else:
+        bounds_signature = "no_object_bounds"
     cache_key = (
         f"GRP_{tree_name}_{_group_intent_signature(group_tree, intent_map)}_"
-        f"{layout_signature}_{color_signature}"
+        f"{layout_signature}_{color_signature}_{bounds_signature}"
     )
 
     if _cache.has_material(cache_key):
@@ -2021,6 +2408,7 @@ def convert_node_group(
                 report_context_name,
                 auto_arrange,
                 color_nodes,
+                object_context,
             ),
             context_name=new_tree.name,
             intent_map=intent_map,
@@ -2081,6 +2469,14 @@ def convert_node_group(
             analysis=analysis,
             node_map=node_map,
             graph_engine=engine,
+        )
+        _apply_scale_correction(
+            object_context,
+            node_map,
+            analysis,
+            intent_map=intent_map,
+            source_tree=group_tree,
+            target_tree=new_tree,
         )
         _validate_converted_tree(new_tree.name, new_tree)
 
@@ -2161,6 +2557,17 @@ def _preserve_drivers(
             # Value nodes are driven on their output in Cycles, but Octane expects input 0 to be driven.
             oct_idx = 0
         elif not is_output_driven and orig_socket_name:
+            if (
+                orig_info.bl_idname in _C4D_PROCEDURAL_TYPES
+                and getattr(oct_node, "bl_idname", "")
+                == "OctaneCinema4DNoise"
+                and orig_socket_name not in _C4D_LINKABLE_INPUTS
+            ):
+                report_data.add_approximation(
+                    f"[{target_tree.name}] Driver on {node_name}."
+                    f"{orig_socket_name} cannot be rebound to Cinema 4D Noise"
+                )
+                continue
             oct_socket = resolve_input_socket(orig_info.bl_idname, orig_socket_name, oct_node)
             if oct_socket:
                 for i, s in enumerate(oct_node.inputs):
@@ -2330,6 +2737,7 @@ def _populate_converted_material(
             original.name,
             auto_arrange,
             color_nodes,
+            obj,
         ),
         context_name=converted.name,
         reuse_output_nodes=clear_existing,
@@ -2396,7 +2804,14 @@ def _populate_converted_material(
         node_map=node_map,
         graph_engine=engine,
     )
-    _apply_scale_correction(obj, node_map, analysis)
+    _apply_scale_correction(
+        obj,
+        node_map,
+        analysis,
+        intent_map=intent_map,
+        source_tree=original.node_tree,
+        target_tree=converted.node_tree,
+    )
     _preserve_drivers(original.node_tree, analysis, node_map, converted.node_tree)
     _validate_converted_tree(converted.name, converted.node_tree)
 
@@ -2608,6 +3023,128 @@ def collect_material_work_items(
     return work_items
 
 
+def _object_bounds_signature(obj: bpy.types.Object | None) -> str:
+    """Return a stable discriminator for an object's local bounding box."""
+    bounds = list(getattr(obj, "bound_box", ()) or ()) if obj is not None else []
+    if not bounds:
+        return "no_object_bounds"
+    try:
+        normalized = tuple(
+            tuple(round(float(value), 6) for value in point)
+            for point in bounds
+        )
+    except (TypeError, ValueError):
+        return "no_object_bounds"
+    return hashlib.sha1(repr(normalized).encode("utf-8")).hexdigest()[:10]
+
+
+def _material_uses_generated_scale_matching(
+    material: bpy.types.Material,
+) -> bool:
+    """Check Phase 1 intent data for bbox-relative procedural coordinates."""
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return False
+    try:
+        intent_map = trace_shading_intent(_selected_material_output(tree))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    procedural_types = {
+        "ShaderNodeTexNoise",
+        "ShaderNodeTexVoronoi",
+        "ShaderNodeTexMusgrave",
+    }
+    return any(
+        getattr(node, "bl_idname", "") in procedural_types
+        and CoordinateSource.GENERATED in sources
+        for node, sources in intent_map.coordinate_sources.items()
+    )
+
+
+def _specialize_bbox_relative_materials(
+    work_items: list[tuple[bpy.types.Object, bpy.types.Material, object | None]],
+) -> tuple[
+    list[tuple[bpy.types.Object, bpy.types.Material, object | None]],
+    list[bpy.types.Material],
+]:
+    """Copy shared Generated-coordinate materials for distinct local bounds.
+
+    Octane UVW transforms are material data, while Cycles Generated coordinates
+    normalize separately for each object's local bounding box.  A single shared
+    material therefore cannot carry exact constants for differently shaped mesh
+    datablocks.  Assignable material slots are specialized before conversion;
+    Geometry Nodes references remain shared and are reported when their bounds
+    conflict because rewriting authored node groups is outside material conversion.
+    """
+    grouped: dict[int, list[tuple[int, str, object | None]]] = {}
+    materials: dict[int, bpy.types.Material] = {}
+    for index, (obj, material, slot) in enumerate(work_items):
+        identity = _rna_identity(material)
+        materials[identity] = material
+        grouped.setdefault(identity, []).append(
+            (index, _object_bounds_signature(obj), slot)
+        )
+
+    specialized = list(work_items)
+    created_sources: list[bpy.types.Material] = []
+    for identity, entries in grouped.items():
+        concrete_signatures = {
+            signature
+            for _index, signature, _slot in entries
+            if signature != "no_object_bounds"
+        }
+        if len(concrete_signatures) <= 1:
+            continue
+        material = materials[identity]
+        if not _material_uses_generated_scale_matching(material):
+            continue
+
+        geometry_signatures = [
+            signature
+            for _index, signature, slot in entries
+            if slot is None and signature != "no_object_bounds"
+        ]
+        primary_signature = (
+            geometry_signatures[0]
+            if geometry_signatures
+            else next(
+                signature
+                for _index, signature, _slot in entries
+                if signature != "no_object_bounds"
+            )
+        )
+        copies: dict[str, bpy.types.Material] = {}
+        unassignable_signatures: set[str] = set()
+        for index, signature, slot in entries:
+            if signature in (primary_signature, "no_object_bounds"):
+                continue
+            if slot is None:
+                unassignable_signatures.add(signature)
+                continue
+            copy = copies.get(signature)
+            if copy is None:
+                copy = material.copy()
+                copy.name = f"{material.name}_OCTANIFY_BOUNDS_{signature}"
+                copies[signature] = copy
+                created_sources.append(copy)
+            obj, _source, original_slot = specialized[index]
+            specialized[index] = (obj, copy, original_slot)
+
+        if copies:
+            report_data.add_notice(
+                f"[{material.name}] Created {len(copies)} material variant(s) "
+                "to preserve Generated-coordinate scale across distinct local bounds"
+            )
+        if unassignable_signatures:
+            report_data.add_approximation(
+                f"[{material.name}] Geometry Nodes shares this Generated-coordinate "
+                "material across incompatible local bounds; Set Material references "
+                "cannot be specialized without rewriting the authored Geometry Nodes graph"
+            )
+
+    return specialized, created_sources
+
+
 def convert_object_materials(
     obj: bpy.types.Object,
     gamma_value: float = 2.2,
@@ -2642,6 +3179,9 @@ def convert_objects_materials(
         reset_cache()
 
     work_items = collect_material_work_items(objects)
+    work_items, specialized_sources = _specialize_bbox_relative_materials(
+        work_items
+    )
 
     converted: list[bpy.types.Material] = []
     converted_ids: set[int] = set()
@@ -2677,6 +3217,14 @@ def convert_objects_materials(
                 converted_ids.add(identity)
         if progress_callback is not None:
             _material_progress(1.0, label)
+
+    for source in specialized_sources:
+        if getattr(source, "users", 0) != 0:
+            continue
+        try:
+            bpy.data.materials.remove(source)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
 
     return converted
 

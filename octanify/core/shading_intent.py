@@ -41,6 +41,18 @@ class TextureTreatment(Enum):
     DATA = "data"
 
 
+class CoordinateSource(Enum):
+    """Texture-coordinate domain feeding a traced procedural node."""
+
+    GENERATED = "Generated"
+    OBJECT = "Object"
+    UV = "UV"
+    CAMERA = "Camera"
+    WINDOW = "Window"
+    NORMAL = "Normal"
+    REFLECTION = "Reflection"
+
+
 OutputKey = tuple[Any, str]
 LinkKey = tuple[Any, str, Any, str]
 TerminalInputKey = tuple[Any, str]
@@ -76,6 +88,7 @@ class ShadingIntentMap(dict[OutputKey, set[Role]]):
         self.terminal_treatments: dict[
             TerminalInputKey, set[TextureTreatment]
         ] = {}
+        self.coordinate_sources: dict[Any, set[CoordinateSource]] = {}
 
     @staticmethod
     def _output_key(node: Any, socket_name: str) -> OutputKey:
@@ -139,6 +152,22 @@ class ShadingIntentMap(dict[OutputKey, set[Role]]):
         self.terminal_inputs.setdefault(key, set()).add(role)
         if treatment is not None:
             self.terminal_treatments.setdefault(key, set()).add(treatment)
+
+    def add_coordinate_source(
+        self,
+        node: Any,
+        source: CoordinateSource,
+    ) -> None:
+        self.coordinate_sources.setdefault(node, set()).add(source)
+
+    def coordinate_sources_for(self, node: Any) -> set[CoordinateSource]:
+        sources = self.coordinate_sources.get(node)
+        if sources is not None:
+            return set(sources)
+        for candidate, candidate_sources in self.coordinate_sources.items():
+            if _same_rna(candidate, node):
+                return set(candidate_sources)
+        return set()
 
     def roles_for(self, node: Any, output_socket_name: str | None = None) -> set[Role]:
         """Return roles for one output, or the union across a node's outputs."""
@@ -353,6 +382,17 @@ _TERMINAL_PRODUCER_TYPES = {
     "ShaderNodeUVMap",
 }
 
+_SCALE_MATCHED_PROCEDURAL_TYPES = {
+    "ShaderNodeTexNoise",
+    "ShaderNodeTexVoronoi",
+    "ShaderNodeTexMusgrave",
+}
+
+_COORDINATE_OUTPUTS = {
+    source.value: source
+    for source in CoordinateSource
+}
+
 
 def _socket_get(collection: Any, name: str) -> Any | None:
     getter = getattr(collection, "get", None)
@@ -409,6 +449,9 @@ class _IntentTracer:
         self.result = ShadingIntentMap()
         self._value_visited: set[tuple[int, str, Role, tuple[int, ...]]] = set()
         self._shader_visited: set[tuple[int, str, tuple[int, ...]]] = set()
+        self._coordinate_visited: set[
+            tuple[int, int, str, tuple[int, ...]]
+        ] = set()
         self._depth_warning_emitted = False
 
     def trace(self) -> ShadingIntentMap:
@@ -540,6 +583,9 @@ class _IntentTracer:
             )
             return
 
+        if node_type in _SCALE_MATCHED_PROCEDURAL_TYPES:
+            self._trace_coordinate_source(node, contexts, depth)
+
         if node_type in _TERMINAL_PRODUCER_TYPES:
             return
 
@@ -576,6 +622,123 @@ class _IntentTracer:
             self._trace_input(
                 input_socket, role, treatment, contexts, depth
             )
+
+    def _trace_coordinate_source(
+        self,
+        procedural_node: Any,
+        contexts: tuple[Any, ...],
+        depth: int,
+    ) -> None:
+        vector = _socket_get(
+            getattr(procedural_node, "inputs", ()), "Vector"
+        )
+        if vector is None or not getattr(vector, "links", None):
+            # Cycles procedural textures use Generated coordinates when their
+            # vector input is unconnected.
+            self.result.add_coordinate_source(
+                procedural_node, CoordinateSource.GENERATED
+            )
+            return
+        self._walk_coordinate_input(
+            procedural_node, vector, contexts, depth + 1
+        )
+
+    def _walk_coordinate_input(
+        self,
+        procedural_node: Any,
+        input_socket: Any,
+        contexts: tuple[Any, ...],
+        depth: int,
+    ) -> None:
+        for link in getattr(input_socket, "links", ()):
+            self._walk_coordinate_output(
+                procedural_node,
+                link.from_node,
+                link.from_socket,
+                contexts,
+                depth + 1,
+            )
+
+    def _walk_coordinate_output(
+        self,
+        procedural_node: Any,
+        node: Any,
+        output_socket: Any,
+        contexts: tuple[Any, ...],
+        depth: int,
+    ) -> None:
+        if depth > self.max_depth:
+            self._warn_depth()
+            return
+
+        visit_key = (
+            _rna_identity(procedural_node),
+            _rna_identity(node),
+            getattr(output_socket, "name", ""),
+            tuple(_rna_identity(context) for context in contexts),
+        )
+        if visit_key in self._coordinate_visited:
+            return
+        self._coordinate_visited.add(visit_key)
+
+        node_type = getattr(node, "bl_idname", "")
+        if node_type == "ShaderNodeTexCoord":
+            source = _COORDINATE_OUTPUTS.get(
+                getattr(output_socket, "name", "")
+            )
+            if source is not None:
+                self.result.add_coordinate_source(procedural_node, source)
+            return
+        if node_type == "ShaderNodeUVMap":
+            self.result.add_coordinate_source(
+                procedural_node, CoordinateSource.UV
+            )
+            return
+        if node_type == "NodeReroute":
+            inputs = getattr(node, "inputs", ())
+            if inputs:
+                self._walk_coordinate_input(
+                    procedural_node, inputs[0], contexts, depth
+                )
+            return
+        if node_type == "ShaderNodeGroup":
+            for group_output in self._group_outputs(node):
+                internal_input = _matching_socket(
+                    node.outputs, output_socket, group_output.inputs
+                )
+                if internal_input is not None:
+                    self._walk_coordinate_input(
+                        procedural_node,
+                        internal_input,
+                        (*contexts, node),
+                        depth,
+                    )
+            return
+        if node_type == "NodeGroupInput":
+            if not contexts:
+                return
+            group_node = contexts[-1]
+            external_input = _matching_socket(
+                node.outputs, output_socket, group_node.inputs
+            )
+            if external_input is not None:
+                self._walk_coordinate_input(
+                    procedural_node,
+                    external_input,
+                    contexts[:-1],
+                    depth,
+                )
+            return
+
+        # Mapping and vector-processing nodes remain transparent to source
+        # classification.  This shares the same socket/group context rules as
+        # destination-intent tracing instead of maintaining a converter-side
+        # link walk.
+        for candidate in getattr(node, "inputs", ()):
+            if getattr(candidate, "links", None):
+                self._walk_coordinate_input(
+                    procedural_node, candidate, contexts, depth
+                )
 
     def _group_outputs(self, group_node: Any) -> list[Any]:
         node_tree = getattr(group_node, "node_tree", None)

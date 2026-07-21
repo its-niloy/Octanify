@@ -186,7 +186,7 @@ _PROPERTY_KEYS: dict[str, list[str]] = {
     "ShaderNodeNormalMap": ["space", "uv_map"],
     "ShaderNodeBump": ["invert"],
     "ShaderNodeTexImage": ["interpolation", "projection", "extension"],
-    "ShaderNodeTexNoise": ["noise_dimensions"],
+    "ShaderNodeTexNoise": ["noise_dimensions", "noise_type", "normalize"],
     "ShaderNodeTexVoronoi": ["voronoi_dimensions", "feature", "distance"],
     "ShaderNodeTexWave": ["wave_type", "wave_profile", "bands_direction", "rings_direction"],
     "ShaderNodeTexMusgrave": ["musgrave_dimensions", "musgrave_type"],

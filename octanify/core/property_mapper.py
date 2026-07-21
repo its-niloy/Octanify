@@ -28,6 +28,31 @@ MIX_BLEND_TYPE_MAP = {
     "VALUE": "Value"
 }
 
+# Live RNA values from Octane 31.9's Composite Texture Layer enum.  These
+# identifiers include their category prefix; the human-readable Blender blend
+# names are not accepted by the socket.
+COMPOSITE_BLEND_TYPE_MAP = {
+    "MIX": "Mix|Normal",
+    "ADD": "Blend|Add",
+    "MULTIPLY": "Blend|Multiply",
+    "DARKEN": "Photometric|Darken",
+    "BURN": "Photometric|Color burn",
+    "LIGHTEN": "Photometric|Lighten",
+    "SCREEN": "Photometric|Screen",
+    "DODGE": "Photometric|Color dodge",
+    "OVERLAY": "Translucent|Overlay",
+    "SOFT_LIGHT": "Translucent|Soft light",
+    "LINEAR_LIGHT": "Translucent|Linear light",
+    "SUBTRACT": "Arithmetic|Subtract",
+    "DIVIDE": "Arithmetic|Divide",
+    "DIFFERENCE": "Arithmetic|Difference",
+    "EXCLUSION": "Arithmetic|Exclusion",
+    "HUE": "Spectral|Hue",
+    "SATURATION": "Spectral|Saturation",
+    "COLOR": "Spectral|Color",
+    "VALUE": "Spectral|Value",
+}
+
 MATH_TYPE_MAP = {
     "ADD": "Add", "SUBTRACT": "Subtract", "MULTIPLY": "Multiply", "DIVIDE": "Divide",
     "MULTIPLY_ADD": "Multiply Add", "POWER": "Power", "LOGARITHM": "Logarithm",
@@ -106,6 +131,18 @@ def _set_prop(node: "bpy.types.Node", attr: str, value: Any) -> bool:
         return False
 
 
+def _node_tag(node: "bpy.types.Node", key: str, default: Any = None) -> Any:
+    """Read an Octanify custom property from RNA nodes and test doubles."""
+    getter = getattr(node, "get", None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except TypeError:
+            value = getter(key)
+            return default if value is None else value
+    return getattr(node, key, default)
+
+
 def _get_candidates(cycles_type: str, socket_name: str) -> list[str]:
     """Look up Octane input candidates for a given Cycles socket."""
     return INPUT_MAP.get(cycles_type, {}).get(socket_name, [socket_name])
@@ -132,6 +169,35 @@ def _get_input_value(info: "NodeInfo", name: str, default: Any = None) -> Any:
                 return val
 
     return default
+
+
+def _get_mix_input_value(
+    info: "NodeInfo",
+    name: str,
+    default: Any = None,
+) -> Any:
+    """Resolve the enabled socket of Blender's polymorphic Mix node."""
+    data_type = info.properties.get("data_type", "RGBA")
+    suffix = {
+        "FLOAT": "Float",
+        "VECTOR": "Vector",
+        "RGBA": "Color",
+        "ROTATION": "Rotation",
+    }.get(data_type)
+    if name == "Factor":
+        suffix = (
+            "Vector"
+            if data_type == "VECTOR"
+            and info.properties.get("factor_mode") == "NON_UNIFORM"
+            else "Float"
+        )
+    if suffix is not None:
+        identifier_value = _get_input_value(
+            info, f"{name}_{suffix}", None
+        )
+        if identifier_value is not None:
+            return identifier_value
+    return _get_input_value(info, name, default)
 
 
 def _get_output_value(info: "NodeInfo", name: str, default: Any = None) -> Any:
@@ -576,16 +642,39 @@ def _transfer_mapping(info: "NodeInfo", node: "bpy.types.Node") -> None:
 
 
 def _transfer_mix_rgb(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """MixRGB → Octane CyclesMixColorNodeWrapper."""
+    """MixRGB → Composite Texture layers or the legacy wrapper fallback."""
     fac = _get_input_value(info, "Fac")
+    c1 = _get_input_value(info, "Color1")
+    c2 = _get_input_value(info, "Color2")
+    blend_type = info.properties.get("blend_type", "MIX")
+    layer_role = _node_tag(node, "octanify_mix_layer", "")
+
+    if getattr(node, "bl_idname", "") == "OctaneCompositeTexture":
+        _set_input(node, ["Clamp"], info.properties.get("use_clamp", False))
+        return
+    if layer_role == "base":
+        _set_input(node, ["Enabled"], True)
+        _set_input(node, ["Input"], c1)
+        _set_input(node, ["Opacity"], 1.0)
+        _set_input(node, ["Blend mode"], "Mix|Normal")
+        return
+    if layer_role == "blend":
+        _set_input(node, ["Enabled"], True)
+        _set_input(node, ["Input"], c2)
+        _set_input(node, ["Opacity"], 1.0 if fac is None else fac)
+        _set_input(
+            node,
+            ["Blend mode"],
+            COMPOSITE_BLEND_TYPE_MAP.get(blend_type, "Mix|Normal"),
+        )
+        return
+
     if fac is not None:
         _set_input(node, ["Factor", "Amount"], fac)
 
-    c1 = _get_input_value(info, "Color1")
     if c1 is not None:
         _set_input(node, ["A", "Texture1", "Color1", "Input1"], c1)
 
-    c2 = _get_input_value(info, "Color2")
     if c2 is not None:
         _set_input(node, ["B", "Texture2", "Color2", "Input2"], c2)
 
@@ -593,28 +682,47 @@ def _transfer_mix_rgb(info: "NodeInfo", node: "bpy.types.Node") -> None:
     _set_input(node, ["Clamp Result(Int)"], 1 if use_clamp else 0)
     _set_input(node, ["Clamp Result"], use_clamp)
 
-    blend_type = info.properties.get("blend_type", "MIX")
     oct_blend_type = MIX_BLEND_TYPE_MAP.get(blend_type, "Mix")
     _set_input(node, ["Blend Type"], oct_blend_type)
 
 
 def _transfer_mix(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """Blender 4+ Mix node → Octane Mix Wrappers."""
-    fac = _get_input_value(info, "Factor")
+    """Blender 4+ color Mix → Composite layers or wrapper fallback."""
+    fac = _get_mix_input_value(info, "Factor")
     if fac is None:
         fac = _get_input_value(info, "Fac")
+    a = _get_mix_input_value(info, "A")
+    b = _get_mix_input_value(info, "B")
+    blend_type = info.properties.get("blend_type", "MIX")
+    layer_role = _node_tag(node, "octanify_mix_layer", "")
+
+    if getattr(node, "bl_idname", "") == "OctaneCompositeTexture":
+        _set_input(node, ["Clamp"], info.properties.get("clamp_result", False))
+        return
+    if layer_role == "base":
+        _set_input(node, ["Enabled"], True)
+        _set_input(node, ["Input"], a)
+        _set_input(node, ["Opacity"], 1.0)
+        _set_input(node, ["Blend mode"], "Mix|Normal")
+        return
+    if layer_role == "blend":
+        _set_input(node, ["Enabled"], True)
+        _set_input(node, ["Input"], b)
+        _set_input(node, ["Opacity"], 1.0 if fac is None else fac)
+        _set_input(
+            node,
+            ["Blend mode"],
+            COMPOSITE_BLEND_TYPE_MAP.get(blend_type, "Mix|Normal"),
+        )
+        return
+
     if fac is not None:
         _set_input(node, ["Factor", "Amount"], fac)
-
-    a = _get_input_value(info, "A")
     if a is not None:
         _set_input(node, ["A", "Texture1", "Color1", "Input1"], a)
-
-    b = _get_input_value(info, "B")
     if b is not None:
         _set_input(node, ["B", "Texture2", "Color2", "Input2"], b)
 
-    blend_type = info.properties.get("blend_type", "MIX")
     oct_blend_type = MIX_BLEND_TYPE_MAP.get(blend_type, "Mix")
     _set_input(node, ["Blend Type"], oct_blend_type)
 
@@ -717,6 +825,7 @@ def _transfer_rgb(info: "NodeInfo", node: "bpy.types.Node") -> None:
     color = _get_output_value(info, "Color")
     if color is not None:
         _set_input(node, ["Color", "Input"], color)
+        _set_prop(node, "a_value", tuple(color[:3]))
         _set_prop(node, "default_value", color)
 
 
@@ -725,6 +834,7 @@ def _transfer_value(info: "NodeInfo", node: "bpy.types.Node") -> None:
     val = _get_output_value(info, "Value")
     if val is not None:
         _set_input(node, ["Value", "Input"], val)
+        _set_prop(node, "a_value", val)
         _set_prop(node, "default_value", val)
 
 
@@ -761,15 +871,108 @@ def _transfer_ambient_occlusion(info: "NodeInfo", node: "bpy.types.Node") -> Non
 
 
 def _transfer_noise(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """Noise Texture → Octane Noise Texture."""
-    _set_input(node, ["Omega", "W", "Scale"], _get_input_value(info, "Scale", 5.0))
-    _set_input(node, ["Octaves", "Detail"], _get_input_value(info, "Detail", 2.0))
-    _set_input(node, ["Lacunarity", "Roughness"], _get_input_value(info, "Roughness", 0.5))
+    """Noise/Musgrave → native Cinema 4D noise, with legacy fallback."""
+    scale = _get_input_value(info, "Scale", 5.0)
+    detail = _get_input_value(info, "Detail", 2.0)
+    roughness = _get_input_value(info, "Roughness", 0.5)
+    lacunarity = _get_input_value(info, "Lacunarity", 2.0)
+
+    if getattr(node, "bl_idname", "") == "OctaneCinema4DNoise":
+        cycles_noise_type = (
+            info.properties.get("musgrave_type", "FBM")
+            if info.bl_idname == "ShaderNodeTexMusgrave"
+            else info.properties.get("noise_type", "FBM")
+        )
+        noise_type = {
+            "MULTIFRACTAL": "FBM",
+            "RIDGED_MULTIFRACTAL": "Ridged Multi Fractal",
+            "HYBRID_MULTIFRACTAL": "Ridged Multi Fractal",
+            "FBM": "FBM",
+            "HETERO_TERRAIN": "Displaced Turbulence",
+        }.get(cycles_noise_type, "FBM")
+        _set_input(node, ["Power"], 1.0)
+        _set_input(node, ["Noise type"], noise_type)
+        _set_input(node, ["Octaves"], max(0.0, min(15.0, float(detail))))
+        _set_input(node, ["Lacunarity"], max(0.1, min(10.0, float(lacunarity))))
+        _set_input(node, ["Gain"], max(-10.0, min(10.0, float(roughness))))
+
+        dimensions = info.properties.get(
+            "musgrave_dimensions"
+            if info.bl_idname == "ShaderNodeTexMusgrave"
+            else "noise_dimensions",
+            "3D",
+        )
+        # Cinema 4D Noise switches between a two-coordinate and a
+        # four-coordinate implementation.  Cycles 3D Noise needs the latter
+        # too (with a fixed T), otherwise Z is discarded and a front-facing
+        # cube degenerates into one-dimensional vertical bands.
+        _set_input(node, ["Use 4D noise"], dimensions in {"3D", "4D"})
+        if dimensions == "4D":
+            _set_input(node, ["T"], _get_input_value(info, "W", 0.0))
+
+        from .report import report_data
+        if dimensions == "1D":
+            report_data.add_approximation(
+                f"[{node.name}] One-dimensional Cycles Noise has no direct "
+                "Cinema 4D Noise coordinate mode"
+            )
+        if info.properties.get("normalize") is False:
+            report_data.add_approximation(
+                f"[{node.name}] Unnormalized Cycles Noise has no direct "
+                "Cinema 4D Noise output-range control"
+            )
+
+        distortion = float(_get_input_value(info, "Distortion", 0.0) or 0.0)
+        if distortion != 0.0:
+            report_data.add_warning(
+                f"[{node.name}] Cycles Noise Distortion {distortion:g} has no "
+                "direct Cinema 4D FBM parameter"
+            )
+        return
+
+    _set_input(node, ["Omega", "W", "Scale"], scale)
+    _set_input(node, ["Octaves", "Detail"], detail)
+    _set_input(node, ["Roughness", "Lacunarity"], roughness)
+    _set_input(node, ["Distortion"], _get_input_value(info, "Distortion", 0.0))
 
 
 def _transfer_voronoi(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    """Voronoi Texture → Octane Voronoi Texture."""
+    """Voronoi Texture → Cinema 4D Voronoi, with legacy fallback."""
+    if getattr(node, "bl_idname", "") == "OctaneCinema4DNoise":
+        feature = info.properties.get("feature", "F1")
+        noise_type = {
+            "F1": "Voronoi 1",
+            "F2": "Voronoi 2",
+            "SMOOTH_F1": "Displaced Voronoi",
+            "DISTANCE_TO_EDGE": "Voronoi 1",
+            "N_SPHERE_RADIUS": "Voronoi 2",
+        }.get(feature, "Voronoi 1")
+        _set_input(node, ["Power"], 1.0)
+        _set_input(node, ["Noise type"], noise_type)
+        detail = float(_get_input_value(info, "Detail", 0.0) or 0.0)
+        roughness = float(_get_input_value(info, "Roughness", 0.5) or 0.0)
+        lacunarity = float(_get_input_value(info, "Lacunarity", 2.0) or 0.0)
+        _set_input(node, ["Octaves"], max(0.0, min(15.0, detail)))
+        _set_input(node, ["Gain"], max(-10.0, min(10.0, roughness)))
+        _set_input(node, ["Lacunarity"], max(0.1, min(10.0, lacunarity)))
+        dimensions = info.properties.get("voronoi_dimensions", "3D")
+        _set_input(node, ["Use 4D noise"], dimensions in {"3D", "4D"})
+        if dimensions == "4D":
+            _set_input(node, ["T"], _get_input_value(info, "W", 0.0))
+        randomness = float(_get_input_value(info, "Randomness", 1.0) or 0.0)
+        if abs(randomness - 1.0) > 1.0e-8:
+            from .report import report_data
+            report_data.add_approximation(
+                f"[{node.name}] Cycles Voronoi Randomness {randomness:g} has "
+                "no direct Cinema 4D Voronoi control"
+            )
+        return
     _set_input(node, ["Scale"], _get_input_value(info, "Scale", 5.0))
+
+
+def _transfer_white_noise(info: "NodeInfo", node: "bpy.types.Node") -> None:
+    """White Noise → established generic Octane Noise fallback."""
+    _set_input(node, ["W"], _get_input_value(info, "W", 0.0))
 
 
 def _transfer_wave(info: "NodeInfo", node: "bpy.types.Node") -> None:
@@ -972,10 +1175,6 @@ def _transfer_magic_texture(info: "NodeInfo", node: "bpy.types.Node") -> None:
 def _transfer_sky_texture(info: "NodeInfo", node: "bpy.types.Node") -> None:
     _set_input(node, ["Sun direction"], _get_input_value(info, "Sun Direction", (0,0,1)))
     _set_input(node, ["Turbidity"], _get_input_value(info, "Turbidity", 2.2))
-
-
-def _transfer_white_noise(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    _set_input(node, ["W"], _get_input_value(info, "W", 0.0))
 
 
 def _transfer_vector_math(info: "NodeInfo", node: "bpy.types.Node") -> None:
