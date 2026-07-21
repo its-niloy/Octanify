@@ -31,6 +31,7 @@ from ..core.light_converter import (
     convert_light_to_octane,
     light_needs_octane_conversion,
 )
+from ..core.node_registry import principled_material_candidates
 from ..core.world_converter import (
     convert_world_to_octane,
     world_needs_octane_conversion,
@@ -49,6 +50,8 @@ _OCTANE_MATERIAL_TYPES = (
     "ShaderNodeOctStandardSurfaceMat",
     "OctaneUniversalMaterial",
     "ShaderNodeOctUniversalMat",
+    "OctaneGlossyMaterial",
+    "ShaderNodeOctGlossyMat",
 )
 
 
@@ -72,7 +75,11 @@ def _guess_texture_socket(filename: str, node_type: str) -> str:
         r"(diffuse|albedo|_col_|_col\b|\bcol_|_base_|base.?color|_color)",
         name,
     ):
-        return "Base Color" if "Principled" in node_type else "Albedo color"
+        if "Principled" in node_type:
+            return "Base Color"
+        if "Glossy" in node_type:
+            return "Diffuse"
+        return "Albedo color"
     if re.search(r"(rough|rgh)", name):
         return "Roughness"
     if re.search(r"(metal|met(?:al)?ness)", name):
@@ -340,6 +347,12 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
         self._color_nodes = getattr(
             context.scene, "octanify_color_nodes", True
         )
+        self._base_material_type = getattr(
+            context.scene, "octanify_base_material", "STANDARD_SURFACE"
+        )
+        self._smart_material_override = getattr(
+            context.scene, "octanify_smart_material_override", False
+        )
         self._objects = _objects_for_conversion(context)
         self._work_items = _material_work_items(self._objects)
         self._light_objects = [
@@ -584,6 +597,12 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
                     auto_arrange=getattr(self, "_auto_arrange", True),
                     progress_callback=_material_progress,
                     color_nodes=getattr(self, "_color_nodes", True),
+                    base_material_type=getattr(
+                        self, "_base_material_type", "STANDARD_SURFACE"
+                    ),
+                    smart_material_override=getattr(
+                        self, "_smart_material_override", False
+                    ),
                 )
                 if converted is not None and slot is not None:
                     slot.material = converted
@@ -637,6 +656,12 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
                 ),
                 reset_conversion_cache=True,
                 color_nodes=getattr(self, "_color_nodes", True),
+                base_material_type=getattr(
+                    self, "_base_material_type", "STANDARD_SURFACE"
+                ),
+                smart_material_override=getattr(
+                    self, "_smart_material_override", False
+                ),
             )
             _set_progress(
                 context,
@@ -1046,22 +1071,16 @@ class OCTANIFY_OT_create_basic_material(bpy.types.Operator):
         output_node.label = "Octane Output"
         output_node.location = (300, 0)
 
-        # Create the chosen Octane material
+        # Create exactly the selected Octane material. A missing node type is
+        # an actionable plugin error, not a reason to silently create a
+        # different material model.
         mat_node = None
-        if mat_type == "STANDARD_SURFACE":
-            for idname in ("OctaneStandardSurfaceMaterial", "ShaderNodeOctStandardSurfaceMat"):
-                try:
-                    mat_node = nodes.new(idname)
-                    break
-                except (RuntimeError, TypeError, KeyError):
-                    continue
-        if mat_node is None:
-            for idname in ("OctaneUniversalMaterial", "ShaderNodeOctUniversalMat"):
-                try:
-                    mat_node = nodes.new(idname)
-                    break
-                except (RuntimeError, TypeError, KeyError):
-                    continue
+        for idname in principled_material_candidates(mat_type):
+            try:
+                mat_node = nodes.new(idname)
+                break
+            except (RuntimeError, TypeError, KeyError):
+                continue
 
         if mat_node is None:
             try:

@@ -262,6 +262,31 @@ class ShadingIntentMap(dict[OutputKey, set[Role]]):
                 return True
         return False
 
+    def has_active_principled_subsurface(self) -> bool:
+        """Return whether a traced Principled uses a non-zero SSS weight.
+
+        The terminal-input table is populated by the Phase 1 traversal and
+        includes Principled nodes reached through nested shader groups.  A
+        linked non-constant weight is treated as potentially active; a direct
+        Value node remains statically testable so an authored zero does not
+        trigger a material-target override.
+        """
+        nodes_with_albedo = {
+            node
+            for (node, _socket_name), roles in self.terminal_inputs.items()
+            if getattr(node, "bl_idname", "") == "ShaderNodeBsdfPrincipled"
+            and Role.ALBEDO in roles
+        }
+        for node in nodes_with_albedo:
+            for socket_name in ("Subsurface Weight", "Subsurface"):
+                roles = self.terminal_inputs.get((node, socket_name), set())
+                if Role.SUBSURFACE not in roles:
+                    continue
+                socket = _socket_get(getattr(node, "inputs", ()), socket_name)
+                if socket is not None and _socket_effectively_nonzero(socket):
+                    return True
+        return False
+
 
 # Socket name -> (semantic role, color-management treatment).  Treatments
 # distinguish color pins from scalar/data pins inside broad roles such as Coat
@@ -438,6 +463,26 @@ def _is_non_black(value: Any) -> bool:
         return False
     try:
         return any(float(channel) > 0.0 for channel in tuple(value)[:3])
+    except (TypeError, ValueError):
+        return False
+
+
+def _socket_effectively_nonzero(socket: Any) -> bool:
+    """Conservatively evaluate whether a scalar socket can contribute."""
+    links = getattr(socket, "links", ())
+    if links:
+        source_node = links[0].from_node
+        source_type = getattr(source_node, "bl_idname", "")
+        if source_type == "ShaderNodeValue":
+            value = getattr(links[0].from_socket, "default_value", None)
+            try:
+                return abs(float(value)) > 1e-8
+            except (TypeError, ValueError):
+                return True
+        return True
+    value = getattr(socket, "default_value", None)
+    try:
+        return abs(float(value)) > 1e-8
     except (TypeError, ValueError):
         return False
 

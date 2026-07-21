@@ -8,6 +8,11 @@ identity between two different renderers. **Approximate** conversions always
 appear in the conversion report. **Unsupported** nodes remain visible as red
 fallbacks and produce warnings instead of being silently removed.
 
+The current node-RNA validation baseline is Blender 5.1 with OctaneRender for
+Blender 31.9. Ordered candidates provide compatibility paths for other plugin
+versions, but a fallback candidate is not considered runtime-verified until it
+has been exercised in that installed Octane build.
+
 Primary references:
 
 - [Blender 4.5 shader node index](https://docs.blender.org/manual/en/latest/render/shader_nodes/index.html)
@@ -16,6 +21,28 @@ Primary references:
 - [Octane channel picker](https://docs.otoy.com/blender/Channelpicker.html)
 - [Octane emission](https://docs.otoy.com/blender/Emission.html)
 - [Octane media](https://docs.otoy.com/blender/Medium.html)
+
+## Scene-domain conversion
+
+The main **Convert to Octane** operator also handles scene data that is not part
+of a material node tree:
+
+| Cycles domain | Status | Octane strategy / limitation |
+|---|---|---|
+| Point light | Direct | Black Body Emission plus Diffuse Material, with exposure, normalization, radius, and type-specific power conversion |
+| Sun light | Direct | Directional Light with object transform, angular spread, irradiance-based power, and normalization handling |
+| Spot light | Direct | Volumetric Spotlight plus Spotlight distribution, preserving cone size and blend/hardness |
+| Area light | Direct | Black Body mesh-emitter graph while retaining Blender area shape and size settings |
+| Flat-color World | Direct | Texture Environment with Background color and Strength |
+| HDRI World | Direct | RGB Image plus Spherical projection and Texture Environment, preserving strength and Mapping Z rotation |
+| Image gobo | Approximate | Perspective-projected RGB/Alpha image distribution with mapping, inversion, animation, and vignette controls |
+| Light Wrangler gobo | Approximate | Recursively discovers Gobo Light groups or EEVEE stencil fallback and carries focus, vignette, rotation, inversion, and playback controls |
+
+Light and World conversion preserve the original Cycles branches. Blender Light
+and World outputs are targeted to `CYCLES`; generated Octane branches use an
+`ALL` Light Output or `OctaneEditorWorldOutputNode`. Older destructive
+Octanify graphs are migrated when their authored source can be recovered
+unambiguously.
 
 ## Input nodes
 
@@ -48,15 +75,15 @@ Primary references:
 |---|---|---|
 | Material Output | Direct | Preserves authored outputs, resolves Blender's explicit Cycles branch, and creates one `ALL` output selected by Octane |
 | AOV Output | Unsupported | Requires explicit Octane custom-AOV semantics |
-| Light Output | Out of scope | Add-on converts material node trees |
-| World Output | Out of scope | World/environment conversion is not yet implemented |
+| Light Output | Direct | Dedicated light pass preserves the authored `CYCLES` output and creates a separate validated `ALL` Octane output |
+| World Output | Direct | Dedicated World pass preserves the authored `CYCLES` output and creates a separate Octane environment output |
 
 ## Shader nodes
 
 | Cycles node | Status | Octane strategy / limitation |
 |---|---|---|
 | Add Shader | Approximate | 50/50 Mix Material; additive closure energy is not identical |
-| Background | Approximate | Diffuse/emission material behavior, not world conversion |
+| Background | Approximate / context-aware | Material use maps to diffuse/emission behavior; a World Background is handled by the dedicated World converter |
 | Diffuse BSDF | Direct | Diffuse Material |
 | Emission | Direct | Diffuse Material plus generated Texture Emission node; linked/default color and strength preserved |
 | Glass BSDF | Direct | Specular Material; color routed to transmission |
@@ -65,9 +92,9 @@ Primary references:
 | Holdout | Approximate | Null Material |
 | Mix Shader | Direct | Modern Octane Mix Material with duplicate socket identity and branch order preserved |
 | Metallic BSDF | Direct | Metallic Material/Universal fallback |
-| Principled BSDF | Direct | Standard Surface by default with separate base/specular/transmission/coat/sheen/SSS layers; optional Universal uses GGX, scaled specular, and coat/sheen tint × weight composition |
+| Principled BSDF | Direct / selectable approximation | Standard Surface by default; optional Universal preserves its compatible layered controls, while optional Glossy Material maps diffuse/specular/roughness/IOR/anisotropy/sheen/opacity/normal/displacement/thin film and reports unsupported metallic, transmission, coat, subsurface, and emission lobes. An optional SSS override promotes only active-subsurface materials to Standard Surface |
 | Principled Hair BSDF | Approximate | Hair Material/Universal fallback |
-| Principled Volume | Approximate | Volume/Standard Medium candidates |
+| Principled Volume | Approximate | Best-effort Volume/Standard Medium mapping with density converted to Octane's 100-based scale |
 | Ray Portal BSDF | Version-dependent | Portal Material when available; Null fallback |
 | Refraction BSDF | Direct | Specular Material; color routed to transmission |
 | Specular BSDF | Direct | Specular Material candidates |
@@ -76,8 +103,8 @@ Primary references:
 | Translucent BSDF | Direct | Diffuse Material transmission channel |
 | Transparent BSDF | Direct | Null Material |
 | Sheen BSDF | Approximate | Universal Material sheen-compatible inputs |
-| Volume Absorption | Direct | Absorption Medium, topology-routed to the corresponding material |
-| Volume Scatter | Direct | Scattering Medium, topology-routed to the corresponding material |
+| Volume Absorption | Direct | Absorption Medium, topology-routed to the corresponding material with constant or linked density multiplied by 100 |
+| Volume Scatter | Direct | Scattering Medium, topology-routed to the corresponding material with constant or linked density multiplied by 100; a direct Add Shader pairing with Volume Absorption is reconstructed as one native Scattering medium |
 | Volume Coefficients | Unsupported | No validated socket-level mapping yet |
 
 ## Texture nodes
@@ -86,17 +113,17 @@ Primary references:
 |---|---|---|
 | Brick Texture | Approximate | Marble Texture fallback |
 | Checker Texture | Approximate | Checks Texture; factor/color output behavior may differ |
-| Environment Texture | Direct | Octane Image Texture; world routing remains out of scope |
+| Environment Texture | Direct | Material use maps to Octane Image Texture; World use maps to RGB Image, Spherical projection, and Texture Environment |
 | Gabor Texture | Approximate | Noise Texture |
 | Gradient Texture | Approximate | Gradient Texture; mode differences are reported |
 | IES Texture | Unsupported | Requires validated Octane IES-light context |
-| Image Texture | Direct | Contextual RGB/Greyscale/Alpha nodes; mixed Color+Alpha creates a dedicated alpha variant |
+| Image Texture | Direct | Destination roles select RGB/Greyscale/Alpha treatment; mislabeled colorspaces are reported and mixed color/data use creates separate Octane instances |
 | Magic Texture | Approximate | Marble Texture fallback |
-| Musgrave Texture (legacy) | Approximate | Noise Texture |
-| Noise Texture | Approximate | Noise algorithms and multi-outputs differ |
+| Musgrave Texture (legacy) | Approximate | Cinema 4D Noise when available; Generated/Object-coordinate scale is matched through an Octane transform, but algorithms still differ |
+| Noise Texture | Approximate | Cinema 4D Noise when available; Generated/Object-coordinate scale is matched through object bounds and a validated 0.5 frequency correction, but algorithms and multi-outputs differ |
 | Point Density Texture | Unsupported | Requires baking or a point-data pipeline |
 | Sky Texture | Approximate | Daylight Environment candidates |
-| Voronoi Texture | Approximate | Voronoi feature/distance modes differ |
+| Voronoi Texture | Approximate | Cinema 4D Voronoi when available with Generated/Object-coordinate scale matching; feature/distance modes still differ |
 | Wave Texture | Approximate | Wave modes differ |
 | White Noise Texture | Approximate | Noise Texture |
 
@@ -109,15 +136,15 @@ Primary references:
 | Hue/Saturation/Value | Approximate | Color Correction parameter ranges differ by plugin version |
 | Invert | Direct | Invert Texture |
 | Light Falloff | Unsupported | Cycles light-energy falloff outputs are not equivalent to Octane surface Falloff Map |
-| Mix Color | Direct | Official Octane Cycles Mix wrapper, with generic Mix fallback |
-| RGB Curves | Approximate | Color Correction cannot preserve arbitrary curve control points |
+| Mix Color | Direct | Native Composite Texture plus two texture layers when available; construction is transactional and falls back to the official Cycles Mix wrapper or legacy Mix node |
+| RGB Curves | Approximate | Color Correction receives the Cycles Factor as Mask but cannot preserve arbitrary curve control points |
 
 ## Vector nodes
 
 | Cycles node | Status | Octane strategy / limitation |
 |---|---|---|
 | Bump | Direct | Folded into material Bump plus Bump Height; chained Normal is preserved separately |
-| Displacement | Direct | Texture or Vertex Displacement according to settings |
+| Displacement | Direct | The scene preference creates Texture or Vertex Displacement; Scale/Midlevel are transferred, Texture mode receives Level of Detail, and a non-default panel Mid Level overrides the source value |
 | Mapping | Direct | Mapping drives UV Transform while Texture Coordinate/UV Map drives Projection; rotation is converted from radians/XYZ to Octane degrees/XYZ |
 | Normal | Approximate | Normal Texture; verify mode/space |
 | Normal Map | Direct | RGB image routed directly to material Normal when no native node exists |
@@ -151,17 +178,34 @@ Primary references:
 | Cycles node | Status | Octane strategy / limitation |
 |---|---|---|
 | Script (OSL) | Unsupported | Cycles OSL source and Octane OSL execution are not assumed portable |
-| Node Group | Direct | Recursive copy with interface preservation, caching, driver transfer, and recursion guard |
+| Node Group | Direct | Recursive converted copy with interface preservation, caching, driver transfer, and recursion guard; the authored group remains grouped and untouched |
 | Group Input / Output | Direct | Reused from copied group interface |
 | Reroute | Direct | Flattened at link analysis while preserving branches |
-| Frame | Layout-only | Not copied; node positions remain |
+| Frame | Layout-only | Authored frames remain grouped; automatic layout arranges nested contents from the deepest frame outward |
+
+Volume-only Cycles graphs are preserved as a generated Octane Null Material
+with the converted medium attached. When a direct Volume Absorption + Volume
+Scatter pair uses different densities, Octane's shared Scattering-medium density
+cannot represent both independently; the chosen density and limitation are
+reported for manual review.
 
 ## Required manual review
 
 - Procedural texture algorithms are renderer-specific even when names match.
+- Generated-coordinate scale matching uses the object's local bounding box;
+  zero-length axes and rotated mappings on non-uniform bounds are reported for
+  manual verification. UV-coordinate procedurals retain logical scale without
+  bounding-box normalization.
 - Cycles closure addition, Shader to RGB, Light Path, and multi-output geometry
   data do not have general physically equivalent Octane translations.
-- Texture Displacement accepts image textures; procedural displacement may
-  require baking or Vertex Displacement.
+- Texture Displacement accepts image and compatible procedural height fields;
+  unsupported procedural chains may require baking. Vertex Displacement uses
+  mesh vertices/subdivision and should be reviewed at the intended subdivision
+  level.
 - Non-default UV layers are labeled and reported because some Octane versions
   expose UV indices rather than Blender layer names.
+- Light power and gobo projection are translated into the closest validated
+  Octane conventions, but final exposure and projected-edge matching still
+  require render comparison between engines.
+- World Mapping conversion preserves the common Z-rotation path; arbitrary
+  vector-processing chains ahead of an Environment Texture require manual review.

@@ -95,6 +95,7 @@ def _scene(**overrides):
     values = {
         "octanify_batch_mode": "ACTIVE",
         "octanify_base_material": "STANDARD_SURFACE",
+        "octanify_smart_material_override": False,
         "octanify_albedo_gamma": 2.2,
         "octanify_auto_arrange": True,
         "octanify_color_nodes": True,
@@ -132,6 +133,14 @@ class PanelHierarchyTests(unittest.TestCase):
 
         self.assertLess(operator_index, scope_index)
         self.assertLess(scope_index, material_index)
+        override_index = next(
+            index
+            for index, event in enumerate(layout.events)
+            if event[0] == "prop"
+            and event[1] == "octanify_smart_material_override"
+        )
+        self.assertGreater(override_index, material_index)
+        self.assertTrue(layout.events[override_index][2].get("toggle"))
         self.assertTrue(
             any(
                 event[0] == "prop"
@@ -160,6 +169,21 @@ class PanelHierarchyTests(unittest.TestCase):
             any(
                 event[0] == "label"
                 and event[1].get("text") == "Selection + active object's children"
+                for event in layout.events
+            )
+        )
+
+    def test_glossy_material_choice_has_specific_workflow_hint(self) -> None:
+        layout = _RecordingLayout()
+        _draw_conversion_console(
+            layout,
+            SimpleNamespace(scene=_scene(octanify_base_material="GLOSSY")),
+        )
+
+        self.assertTrue(
+            any(
+                event[0] == "label"
+                and event[1].get("text") == "Classic diffuse + glossy workflow"
                 for event in layout.events
             )
         )

@@ -18,10 +18,10 @@ from __future__ import annotations
 bl_info = {
     "name": "Octanify",
     "author": "Niloy Bhowmick",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Octanify",
-    "description": "Convert Cycles materials to Octane materials with one click",
+    "description": "Convert Cycles materials, lights, and Worlds to Octane",
     "category": "Material",
 }
 
@@ -125,8 +125,23 @@ def _register_properties() -> None:
                 "Universal Material",
                 "Octane-native material with compatibility mappings for Principled layers",
             ),
+            (
+                "GLOSSY",
+                "Glossy Material",
+                "Classic Octane diffuse and glossy workflow; advanced Principled lobes are approximated",
+            ),
         ],
         default="STANDARD_SURFACE",
+    )
+
+    bpy.types.Scene.octanify_smart_material_override = bpy.props.BoolProperty(
+        name="Auto-upgrade SSS materials to Standard Surface",
+        description=(
+            "When enabled, Principled materials with active subsurface "
+            "scattering use Octane Standard Surface even when another target "
+            "material is selected"
+        ),
+        default=False,
     )
 
     bpy.types.Scene.octanify_disp_mode = bpy.props.EnumProperty(
@@ -173,6 +188,7 @@ def _unregister_properties() -> None:
         "octanify_progress_active",
         "octanify_albedo_gamma",
         "octanify_base_material",
+        "octanify_smart_material_override",
         "octanify_disp_mode",
         "octanify_disp_mid_level",
         "octanify_disp_level_of_detail",

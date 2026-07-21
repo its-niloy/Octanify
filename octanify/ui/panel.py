@@ -78,8 +78,18 @@ def _draw_conversion_console(
     material_hint.enabled = False
     if scene.octanify_base_material == "STANDARD_SURFACE":
         material_hint.label(text="Recommended - closest Principled match")
-    else:
+    elif scene.octanify_base_material == "UNIVERSAL":
         material_hint.label(text="Compatibility - Universal workflow")
+    else:
+        material_hint.label(text="Classic diffuse + glossy workflow")
+
+    sss_override = console.row()
+    sss_override.prop(
+        scene,
+        "octanify_smart_material_override",
+        text="Auto-upgrade SSS materials to Standard Surface",
+        toggle=True,
+    )
 
     console.separator(factor=0.35)
     layout_options = console.row(align=True)

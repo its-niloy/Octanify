@@ -32,6 +32,7 @@ def _install_bpy_stub() -> None:
     }
     bpy.types = SimpleNamespace(**blender_types)
     bpy.props = SimpleNamespace(
+        BoolProperty=lambda **_kwargs: None,
         EnumProperty=lambda **_kwargs: None,
         FloatProperty=lambda **_kwargs: None,
     )
@@ -50,6 +51,7 @@ from octanify.core.graph_engine import GraphEngine
 from octanify.core.gamma_system import apply_gamma
 from octanify.core.layout_engine import arrange_nodes, style_smart_graphs
 from octanify.core.conversion_engine import (
+    _effective_material_target,
     _apply_scale_correction,
     _handle_alpha,
     _handle_emission_node_insertion,
@@ -67,10 +69,13 @@ from octanify.core.geonodes_scan import collect_geometry_node_materials
 from octanify.core.node_registry import (
     NODE_TYPE_MAP,
     get_contextual_node_candidates,
+    is_glossy_material_node,
+    principled_material_candidates,
     resolve_input_socket,
     resolve_output_socket,
 )
 from octanify.core.property_mapper import (
+    OCTANE_MEDIUM_DENSITY_SCALE,
     _transfer_mix,
     _transfer_mix_rgb,
     _transfer_noise,
@@ -82,6 +87,9 @@ from octanify.core.property_mapper import (
     _transfer_mapping,
     _transfer_principled,
     _transfer_rgb_curve,
+    _transfer_volume_absorption,
+    _transfer_volume_principled,
+    _transfer_volume_scatter,
 )
 from octanify.core.report import report_data
 from octanify.core.shading_intent import (
@@ -349,6 +357,64 @@ class _Nodes(list):
             self.append(node)
             return node
         if type in (
+            "OctaneAbsorption",
+            "ShaderNodeOctAbsorptionMedium",
+            "OctaneAbsorptionMedium",
+        ):
+            node = _Node(
+                "Absorption",
+                type,
+                inputs=[
+                    _Socket("Density", 100.0),
+                    _Socket("Absorption", (0.5, 0.5, 0.5, 1.0)),
+                    _Socket("Invert absorption", True),
+                ],
+                outputs=[_Socket("Medium out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in (
+            "OctaneTextureDisplacement",
+            "ShaderNodeOctDisplacementTex",
+            "OctaneVertexDisplacement",
+            "ShaderNodeOctVertexDisplacement",
+        ):
+            node = _Node(
+                "Displacement",
+                type,
+                inputs=[
+                    _Socket("Texture", None),
+                    _Socket("Amount", 1.0),
+                    _Socket("Mid level", 0.5),
+                ],
+                outputs=[_Socket("Displacement out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in (
+            "OctaneScattering",
+            "ShaderNodeOctScatterMedium",
+            "OctaneScatteringMedium",
+        ):
+            node = _Node(
+                "Scattering",
+                type,
+                inputs=[
+                    _Socket("Density", 100.0),
+                    _Socket("Absorption", (0.5, 0.5, 0.5, 1.0)),
+                    _Socket("Scattering", (0.5, 0.5, 0.5, 1.0)),
+                    _Socket("Phase", 0.0),
+                    _Socket("Invert absorption", True),
+                    _Socket("Emission", (0.0, 0.0, 0.0, 1.0)),
+                ],
+                outputs=[_Socket("Medium out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in (
             "OctaneSeparateColor",
             "ShaderNodeOctColorCorrectionTex",
             "OctaneColorCorrection",
@@ -380,14 +446,36 @@ class _Nodes(list):
             "ShaderNodeOctStandardSurfaceMat",
             "OctaneUniversalMaterial",
             "ShaderNodeOctUniversalMat",
+            "OctaneGlossyMaterial",
+            "ShaderNodeOctGlossyMat",
         ):
+            inputs = (
+                [
+                    _Socket("Diffuse", None),
+                    _Socket("Specular", 1.0),
+                    _Socket("Roughness", 0.0632),
+                    _Socket("Index of refraction", 1.5),
+                ]
+                if "Glossy" in type
+                else [
+                    _Socket("Base color", None),
+                    _Socket("Specular roughness", None),
+                ]
+            )
             node = _Node(
                 "Material",
                 type,
-                inputs=[
-                    _Socket("Base color", None),
-                    _Socket("Specular roughness", None),
-                ],
+                inputs=inputs,
+                outputs=[_Socket("Material out")],
+            )
+            _attach_sockets(node)
+            self.append(node)
+            return node
+        if type in ("OctaneNullMaterial", "ShaderNodeOctNullMat"):
+            node = _Node(
+                "Null material",
+                type,
+                inputs=[_Socket("Medium", None), _Socket("Opacity", 1.0)],
                 outputs=[_Socket("Material out")],
             )
             _attach_sockets(node)
@@ -435,6 +523,67 @@ def _link(source: str, target: str, **overrides) -> SimpleNamespace:
 
 
 class GraphScheduleTests(unittest.TestCase):
+    def test_explicit_material_target_is_local_to_each_graph_engine(self) -> None:
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeBsdfPrincipled",
+            label="Principled",
+            location=(0.0, 0.0),
+            properties={},
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Principled", info),)),
+            links=[],
+        )
+
+        universal_tree = SimpleNamespace(
+            name="Universal", nodes=_Nodes(), links=_Links()
+        )
+        standard_tree = SimpleNamespace(
+            name="Standard", nodes=_Nodes(), links=_Links()
+        )
+
+        universal = GraphEngine(
+            analysis, base_material_type="UNIVERSAL"
+        ).create_nodes(universal_tree)["Principled"]
+        standard = GraphEngine(
+            analysis, base_material_type="STANDARD_SURFACE"
+        ).create_nodes(standard_tree)["Principled"]
+
+        self.assertEqual(universal.bl_idname, "OctaneUniversalMaterial")
+        self.assertEqual(standard.bl_idname, "OctaneStandardSurfaceMaterial")
+
+    def test_displacement_scene_mode_selects_texture_or_vertex_node(self) -> None:
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeDisplacement",
+            label="Displacement",
+            location=(0.0, 0.0),
+            properties={},
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Displacement", info),)),
+            links=[],
+        )
+
+        with patch.object(
+            bpy.context,
+            "scene",
+            SimpleNamespace(octanify_disp_mode="TEXTURE"),
+        ):
+            texture = GraphEngine(analysis).create_nodes(
+                SimpleNamespace(name="Texture", nodes=_Nodes(), links=_Links())
+            )["Displacement"]
+        with patch.object(
+            bpy.context,
+            "scene",
+            SimpleNamespace(octanify_disp_mode="VERTEX"),
+        ):
+            vertex = GraphEngine(analysis).create_nodes(
+                SimpleNamespace(name="Vertex", nodes=_Nodes(), links=_Links())
+            )["Displacement"]
+
+        self.assertEqual(texture.bl_idname, "OctaneTextureDisplacement")
+        self.assertEqual(vertex.bl_idname, "ShaderNodeOctVertexDisplacement")
+
     def test_creates_all_target_output_for_octane(self) -> None:
         output_info = SimpleNamespace(
             bl_idname="ShaderNodeOutputMaterial",
@@ -811,6 +960,74 @@ class ShadingIntentTests(unittest.TestCase):
             intent.coordinate_sources_for(noise),
             {CoordinateSource.GENERATED},
         )
+
+    def test_principled_sss_override_uses_traced_nonzero_weight(self) -> None:
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[
+                    _Socket("Base Color", (0.3, 0.1, 0.05, 1.0)),
+                    _Socket("Subsurface Weight", 0.25),
+                ],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+
+        intent = trace_shading_intent(output)
+
+        self.assertTrue(intent.has_active_principled_subsurface())
+        report_data.clear()
+        self.assertEqual(
+            _effective_material_target(
+                "Skin", intent, "UNIVERSAL", smart_material_override=True
+            ),
+            "STANDARD_SURFACE",
+        )
+        self.assertIn(
+            "[Skin] Subsurface detected, converted to Standard Surface "
+            "(override enabled)",
+            report_data.notices,
+        )
+
+    def test_sss_override_is_opt_in_and_ignores_zero_weight(self) -> None:
+        shader = _attach_sockets(
+            _Node(
+                "Principled",
+                "ShaderNodeBsdfPrincipled",
+                inputs=[
+                    _Socket("Base Color", (0.8, 0.8, 0.8, 1.0)),
+                    _Socket("Subsurface Weight", 0.0),
+                ],
+                outputs=[_Socket("BSDF")],
+            )
+        )
+        output = self._material_output()
+        links = _Links()
+        links.new(shader.outputs.get("BSDF"), output.inputs.get("Surface"))
+        zero_intent = trace_shading_intent(output)
+
+        self.assertFalse(zero_intent.has_active_principled_subsurface())
+        self.assertEqual(
+            _effective_material_target(
+                "No SSS", zero_intent, "UNIVERSAL", smart_material_override=True
+            ),
+            "UNIVERSAL",
+        )
+
+        shader.inputs.get("Subsurface Weight").default_value = 0.5
+        active_intent = trace_shading_intent(output)
+        report_data.clear()
+        self.assertEqual(
+            _effective_material_target(
+                "SSS Off", active_intent, "GLOSSY", smart_material_override=False
+            ),
+            "GLOSSY",
+        )
+        self.assertEqual(report_data.notices, [])
 
     def test_roles_are_per_output_and_per_path(self) -> None:
         image = _attach_sockets(
@@ -2059,6 +2276,45 @@ class ModernOctaneNodeTests(unittest.TestCase):
             NODE_TYPE_MAP["ShaderNodeMixShader"][0],
             "OctaneMixMaterial",
         )
+        self.assertEqual(
+            NODE_TYPE_MAP["ShaderNodeBsdfGlossy"][0],
+            "OctaneGlossyMaterial",
+        )
+
+    def test_glossy_option_selects_exact_modern_principled_target(self) -> None:
+        self.assertEqual(
+            principled_material_candidates("GLOSSY"),
+            ["OctaneGlossyMaterial", "ShaderNodeOctGlossyMat"],
+        )
+        info = SimpleNamespace(
+            bl_idname="ShaderNodeBsdfPrincipled",
+            label="Principled",
+            location=(0.0, 0.0),
+            properties={},
+        )
+        analysis = SimpleNamespace(
+            nodes=OrderedDict((("Principled", info),)),
+            links=[],
+        )
+        tree = SimpleNamespace(
+            name="Glossy Selection",
+            nodes=_Nodes(),
+            links=_Links(),
+        )
+        scene = sys.modules["bpy"].context.scene
+        previous = getattr(scene, "octanify_base_material", None)
+        scene.octanify_base_material = "GLOSSY"
+        try:
+            node_map = GraphEngine(analysis).create_nodes(tree)
+        finally:
+            if previous is None:
+                del scene.octanify_base_material
+            else:
+                scene.octanify_base_material = previous
+
+        glossy = node_map["Principled"]
+        self.assertEqual(glossy.bl_idname, "OctaneGlossyMaterial")
+        self.assertTrue(is_glossy_material_node(glossy))
 
     def test_rgb_curve_uses_blenders_singular_rna_identifier(self) -> None:
         self.assertEqual(
@@ -3235,6 +3491,146 @@ class PropertyTransferTests(unittest.TestCase):
         self.assertEqual(node.inputs.get("Subsurface color").default_value, (0.2, 0.4, 0.6))
         self.assertEqual(node.inputs.get("Film thickness (nm)").default_value, 180.0)
 
+    def test_glossy_material_maps_supported_principled_controls(self) -> None:
+        node = _attach_sockets(
+            _Node(
+                "Glossy",
+                "OctaneGlossyMaterial",
+                inputs=[
+                    _Socket("Diffuse", (0.7, 0.7, 0.7, 1.0)),
+                    _Socket("Specular", 1.0),
+                    _Socket("Diffuse BRDF model", "Lambertian"),
+                    _Socket("BRDF model", "Octane"),
+                    _Socket("Roughness", 0.0632),
+                    _Socket("Anisotropy", 0.0),
+                    _Socket("Rotation", 0.0),
+                    _Socket("Film width (um)", 0.0),
+                    _Socket("Film IOR", 1.45),
+                    _Socket("Sheen", (0.0, 0.0, 0.0, 1.0)),
+                    _Socket("Sheen Roughness", 0.2),
+                    _Socket("Index of refraction", 1.5),
+                    _Socket("Opacity", 1.0),
+                ],
+            )
+        )
+        values = {
+            "Base Color": (0.2, 0.4, 0.6, 1.0),
+            "Diffuse Roughness": 0.2,
+            "Specular IOR Level": 0.35,
+            "Roughness": 0.45,
+            "IOR": 1.4,
+            "Anisotropic": 0.25,
+            "Anisotropic Rotation": 0.3,
+            "Sheen Weight": 0.4,
+            "Sheen Tint": (0.5, 0.25, 1.0, 1.0),
+            "Sheen Roughness": 0.6,
+            "Thin Film Thickness": 250.0,
+            "Thin Film IOR": 1.33,
+            "Alpha": 0.8,
+        }
+        info = SimpleNamespace(
+            inputs=values,
+            input_identifiers={name: name for name in values},
+            properties={},
+        )
+
+        _transfer_principled(info, node)
+
+        self.assertEqual(node.inputs.get("Diffuse").default_value, (0.2, 0.4, 0.6, 1.0))
+        self.assertAlmostEqual(node.inputs.get("Specular").default_value, 0.7)
+        self.assertEqual(node.inputs.get("BRDF model").default_value, "GGX")
+        self.assertEqual(
+            node.inputs.get("Diffuse BRDF model").default_value,
+            "Oren-Nayar",
+        )
+        self.assertAlmostEqual(node.inputs.get("Roughness").default_value, 0.45)
+        self.assertAlmostEqual(node.inputs.get("Index of refraction").default_value, 1.4)
+        self.assertAlmostEqual(node.inputs.get("Film width (um)").default_value, 0.25)
+        self.assertEqual(
+            node.inputs.get("Sheen").default_value,
+            (0.2, 0.1, 0.4, 1.0),
+        )
+        self.assertAlmostEqual(node.inputs.get("Opacity").default_value, 0.8)
+
+    def test_glossy_links_supported_inputs_and_rejects_metallic(self) -> None:
+        color = _attach_sockets(
+            _Node("Color", "OctaneRGBImage", outputs=[_Socket("Texture out")])
+        )
+        metallic = _attach_sockets(
+            _Node("Metallic", "OctaneFloatValue", outputs=[_Socket("OutTex")])
+        )
+        material = _attach_sockets(
+            _Node(
+                "Material",
+                "OctaneGlossyMaterial",
+                inputs=[
+                    _Socket("Diffuse", None),
+                    _Socket("Specular", 1.0),
+                ],
+                outputs=[_Socket("Material out")],
+            )
+        )
+        tree = SimpleNamespace(
+            name="Glossy Links",
+            nodes=_Nodes([color, metallic, material]),
+            links=_Links(),
+        )
+        values = {
+            "Metallic": 0.0,
+            "Transmission Weight": 0.0,
+            "Coat Weight": 0.0,
+            "Subsurface Weight": 0.0,
+        }
+        analysis = SimpleNamespace(
+            nodes={
+                "Color": _node_info("ShaderNodeTexImage"),
+                "Metallic": _node_info("ShaderNodeValue"),
+                "Material": SimpleNamespace(
+                    bl_idname="ShaderNodeBsdfPrincipled",
+                    inputs=values,
+                    input_identifiers={name: name for name in values},
+                ),
+            },
+            links=[
+                _link(
+                    "Color",
+                    "Material",
+                    from_socket="Color",
+                    from_socket_identifier="Color",
+                    to_socket="Base Color",
+                    to_socket_identifier="Base Color",
+                ),
+                _link(
+                    "Metallic",
+                    "Material",
+                    from_socket="Value",
+                    from_socket_identifier="Value",
+                    to_socket="Metallic",
+                    to_socket_identifier="Metallic",
+                ),
+            ],
+        )
+        report_data.clear()
+
+        _rebuild_links(
+            analysis,
+            {"Color": color, "Metallic": metallic, "Material": material},
+            tree,
+        )
+        _handle_principled_material_inputs(
+            analysis,
+            {"Color": color, "Metallic": metallic, "Material": material},
+            tree,
+        )
+
+        self.assertIs(material.inputs.get("Diffuse").links[0].from_node, color)
+        self.assertEqual(len(material.inputs.get("Specular").links), 0)
+        self.assertEqual(len(tree.nodes), 3)
+        self.assertTrue(
+            any("Metallic" in message and "Glossy Material" in message
+                for message in report_data.approximations)
+        )
+
     def test_standard_surface_uses_full_base_weight_for_legacy_principled(self) -> None:
         node = _attach_sockets(
             _Node(
@@ -3948,6 +4344,336 @@ class VolumetricTopologyTests(unittest.TestCase):
     def setUp(self) -> None:
         report_data.clear()
 
+    def test_volume_density_values_use_octane_homogeneous_scale(self) -> None:
+        def info(**inputs):
+            return SimpleNamespace(inputs=inputs, input_identifiers={})
+
+        absorption = _Nodes().new("OctaneAbsorption")
+        scatter = _Nodes().new("OctaneScattering")
+        principled = _Nodes().new("OctaneScattering")
+
+        _transfer_volume_absorption(
+            info(Color=(0.2, 0.4, 0.6, 1.0), Density=0.25),
+            absorption,
+        )
+        _transfer_volume_scatter(
+            info(Color=(0.8, 0.7, 0.6, 1.0), Density=1.5, Anisotropy=0.2),
+            scatter,
+        )
+        _transfer_volume_principled(
+            info(
+                Color=(0.7, 0.6, 0.5, 1.0),
+                **{
+                    "Absorption Color": (0.1, 0.2, 0.3, 1.0),
+                    "Density": 0.5,
+                    "Anisotropy": -0.1,
+                    "Emission Color": (0.0, 0.0, 0.0, 1.0),
+                    "Emission Strength": 0.0,
+                },
+            ),
+            principled,
+        )
+
+        self.assertEqual(
+            absorption.inputs.get("Density").default_value,
+            0.25 * OCTANE_MEDIUM_DENSITY_SCALE,
+        )
+        self.assertEqual(
+            scatter.inputs.get("Density").default_value,
+            1.5 * OCTANE_MEDIUM_DENSITY_SCALE,
+        )
+        self.assertEqual(
+            principled.inputs.get("Density").default_value,
+            0.5 * OCTANE_MEDIUM_DENSITY_SCALE,
+        )
+        self.assertEqual(
+            principled.inputs.get("Scattering").default_value,
+            (0.7, 0.6, 0.5, 1.0),
+        )
+        self.assertEqual(
+            principled.inputs.get("Absorption").default_value,
+            (0.1, 0.2, 0.3, 1.0),
+        )
+
+    def test_added_absorption_and_scatter_become_one_scattering_medium(self) -> None:
+        material = _attach_sockets(
+            _Node(
+                "Surface",
+                "OctaneUniversalMaterial",
+                inputs=[_Socket("Medium", None)],
+                outputs=[_Socket("Material out")],
+            )
+        )
+        absorption = _Nodes().new("OctaneAbsorption")
+        absorption.name = "Absorption"
+        absorption.inputs.get("Absorption").default_value = (
+            0.15,
+            0.35,
+            0.55,
+            1.0,
+        )
+        scatter = _Nodes().new("OctaneScattering")
+        scatter.name = "Scatter"
+        add = _attach_sockets(
+            _Node(
+                "Add Shader",
+                "OctaneMixMaterial",
+                inputs=[_Socket("Material 1"), _Socket("Material 2")],
+                outputs=[_Socket("Material out")],
+            )
+        )
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface"), _Socket("Volume")],
+            )
+        )
+        tree = SimpleNamespace(
+            name="Thick Smoke", nodes=_Nodes([material, absorption, scatter, add, output]), links=_Links()
+        )
+        tree.links.new(add.outputs[0], output.inputs.get("Volume"))
+        analysis = SimpleNamespace(
+            has_volume=True,
+            nodes={
+                "Surface": _node_info("ShaderNodeBsdfPrincipled"),
+                "Absorption": _node_info("ShaderNodeVolumeAbsorption"),
+                "Scatter": _node_info("ShaderNodeVolumeScatter"),
+                "Add Shader": _node_info("ShaderNodeAddShader"),
+                "Material Output": _node_info("ShaderNodeOutputMaterial"),
+            },
+            links=[
+                _link("Surface", "Material Output", from_socket="BSDF", to_socket="Surface"),
+                _link("Absorption", "Add Shader", from_socket="Volume", to_socket="Shader"),
+                _link("Scatter", "Add Shader", from_socket="Volume", to_socket="Shader"),
+                _link("Add Shader", "Material Output", from_socket="Shader", to_socket="Volume"),
+            ],
+        )
+
+        handle_volumetrics(
+            analysis,
+            {
+                "Surface": material,
+                "Absorption": absorption,
+                "Scatter": scatter,
+                "Add Shader": add,
+                "Material Output": output,
+            },
+            tree,
+        )
+
+        self.assertIs(
+            material.inputs.get("Medium").links[0].from_node,
+            scatter,
+        )
+        self.assertEqual(
+            scatter.inputs.get("Absorption").default_value,
+            (0.15, 0.35, 0.55, 1.0),
+        )
+        self.assertFalse(output.inputs.get("Volume").links)
+        self.assertTrue(
+            any("rebuilt as one Octane Scattering medium" in notice for notice in report_data.notices)
+        )
+
+    def test_linked_absorption_and_scatter_density_mismatch_is_reported(self) -> None:
+        absorption_density = _attach_sockets(
+            _Node(
+                "Absorption Density",
+                "OctaneFloatValue",
+                outputs=[_Socket("Float out")],
+            )
+        )
+        scatter_density = _attach_sockets(
+            _Node(
+                "Scatter Density",
+                "OctaneFloatValue",
+                outputs=[_Socket("Float out")],
+            )
+        )
+        absorption = _Nodes().new("OctaneAbsorption")
+        absorption.name = "Absorption"
+        scatter = _Nodes().new("OctaneScattering")
+        scatter.name = "Scatter"
+        material = _attach_sockets(
+            _Node(
+                "Surface",
+                "OctaneUniversalMaterial",
+                inputs=[_Socket("Medium")],
+                outputs=[_Socket("Material out")],
+            )
+        )
+        add = _attach_sockets(
+            _Node(
+                "Add Volume",
+                "OctaneMixMaterial",
+                inputs=[_Socket("Material 1"), _Socket("Material 2")],
+                outputs=[_Socket("Material out")],
+            )
+        )
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface"), _Socket("Volume")],
+            )
+        )
+        tree = SimpleNamespace(
+            name="Driven Thick Smoke",
+            nodes=_Nodes([
+                absorption_density,
+                scatter_density,
+                absorption,
+                scatter,
+                material,
+                add,
+                output,
+            ]),
+            links=_Links(),
+        )
+        tree.links.new(
+            absorption_density.outputs[0], absorption.inputs.get("Density")
+        )
+        tree.links.new(
+            scatter_density.outputs[0], scatter.inputs.get("Density")
+        )
+        tree.links.new(add.outputs[0], output.inputs.get("Volume"))
+        analysis = SimpleNamespace(
+            has_volume=True,
+            nodes={
+                "Absorption Density": _node_info("ShaderNodeValue"),
+                "Scatter Density": _node_info("ShaderNodeValue"),
+                "Absorption": _node_info("ShaderNodeVolumeAbsorption"),
+                "Scatter": _node_info("ShaderNodeVolumeScatter"),
+                "Surface": _node_info("ShaderNodeBsdfPrincipled"),
+                "Add Volume": _node_info("ShaderNodeAddShader"),
+                "Material Output": _node_info("ShaderNodeOutputMaterial"),
+            },
+            links=[
+                _link(
+                    "Absorption Density",
+                    "Absorption",
+                    from_socket="Value",
+                    to_socket="Density",
+                ),
+                _link(
+                    "Scatter Density",
+                    "Scatter",
+                    from_socket="Value",
+                    to_socket="Density",
+                ),
+                _link(
+                    "Absorption",
+                    "Add Volume",
+                    from_socket="Volume",
+                    to_socket="Shader",
+                ),
+                _link(
+                    "Scatter",
+                    "Add Volume",
+                    from_socket="Volume",
+                    to_socket="Shader",
+                ),
+                _link(
+                    "Surface",
+                    "Material Output",
+                    from_socket="BSDF",
+                    to_socket="Surface",
+                ),
+                _link(
+                    "Add Volume",
+                    "Material Output",
+                    from_socket="Shader",
+                    to_socket="Volume",
+                ),
+            ],
+        )
+
+        handle_volumetrics(
+            analysis,
+            {
+                "Absorption Density": absorption_density,
+                "Scatter Density": scatter_density,
+                "Absorption": absorption,
+                "Scatter": scatter,
+                "Surface": material,
+                "Add Volume": add,
+                "Material Output": output,
+            },
+            tree,
+        )
+
+        self.assertTrue(
+            any(
+                "different densities" in message
+                for message in report_data.approximations
+            )
+        )
+
+    def test_linked_density_gets_explicit_octane_scale_node(self) -> None:
+        density_source = _attach_sockets(
+            _Node(
+                "Density",
+                "OctaneFloatValue",
+                outputs=[_Socket("Float out")],
+            )
+        )
+        scatter = _Nodes().new("OctaneScattering")
+        scatter.name = "Scatter"
+        material = _attach_sockets(
+            _Node(
+                "Surface",
+                "OctaneUniversalMaterial",
+                inputs=[_Socket("Medium")],
+                outputs=[_Socket("Material out")],
+            )
+        )
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface"), _Socket("Volume")],
+            )
+        )
+        tree = SimpleNamespace(
+            name="Linked Fog",
+            nodes=_Nodes([density_source, scatter, material, output]),
+            links=_Links(),
+        )
+        tree.links.new(density_source.outputs[0], scatter.inputs.get("Density"))
+        tree.links.new(scatter.outputs[0], output.inputs.get("Volume"))
+        analysis = SimpleNamespace(
+            has_volume=True,
+            nodes={
+                "Density": _node_info("ShaderNodeValue"),
+                "Scatter": _node_info("ShaderNodeVolumeScatter"),
+                "Surface": _node_info("ShaderNodeBsdfPrincipled"),
+                "Material Output": _node_info("ShaderNodeOutputMaterial"),
+            },
+            links=[
+                _link("Density", "Scatter", from_socket="Value", to_socket="Density"),
+                _link("Scatter", "Material Output", from_socket="Volume", to_socket="Volume"),
+                _link("Surface", "Material Output", from_socket="BSDF", to_socket="Surface"),
+            ],
+        )
+
+        handle_volumetrics(
+            analysis,
+            {
+                "Density": density_source,
+                "Scatter": scatter,
+                "Surface": material,
+                "Material Output": output,
+            },
+            tree,
+        )
+
+        multiplier = scatter.inputs.get("Density").links[0].from_node
+        self.assertEqual(multiplier.bl_idname, "OctaneMultiplyTexture")
+        self.assertEqual(
+            multiplier.inputs.get("Texture 2").default_value,
+            OCTANE_MEDIUM_DENSITY_SCALE,
+        )
+
     def test_volume_is_attached_to_surface_from_same_material_output(self) -> None:
         material = _attach_sockets(
             _Node(
@@ -4019,6 +4745,67 @@ class VolumetricTopologyTests(unittest.TestCase):
         self.assertEqual(len(material.inputs.get("Medium").links), 1)
         self.assertIs(material.inputs.get("Medium").links[0].from_node, volume)
         self.assertEqual(len(output.inputs.get("Volume").links), 0)
+
+    def test_volume_only_graph_gets_native_null_material_owner(self) -> None:
+        volume = _Nodes().new("OctaneScattering")
+        volume.name = "Fog"
+        output = _attach_sockets(
+            _Node(
+                "Material Output",
+                "ShaderNodeOutputMaterial",
+                inputs=[_Socket("Surface", None), _Socket("Volume", None)],
+            )
+        )
+        tree = SimpleNamespace(
+            name="Volume Only",
+            nodes=_Nodes([volume, output]),
+            links=_Links(),
+        )
+        tree.links.new(volume.outputs[0], output.inputs.get("Volume"))
+        analysis = SimpleNamespace(
+            has_volume=True,
+            nodes={
+                "Fog": _node_info("ShaderNodeVolumeScatter"),
+                "Material Output": _node_info("ShaderNodeOutputMaterial"),
+            },
+            links=[
+                _link(
+                    "Fog",
+                    "Material Output",
+                    from_socket="Volume",
+                    to_socket="Volume",
+                    from_socket_identifier="Volume",
+                    to_socket_identifier="Volume",
+                ),
+            ],
+        )
+
+        handle_volumetrics(
+            analysis,
+            {"Fog": volume, "Material Output": output},
+            tree,
+        )
+
+        null_material = next(
+            node for node in tree.nodes
+            if node.bl_idname == "OctaneNullMaterial"
+        )
+        self.assertIs(
+            output.inputs.get("Surface").links[0].from_node,
+            null_material,
+        )
+        self.assertIs(
+            null_material.inputs.get("Medium").links[0].from_node,
+            volume,
+        )
+        self.assertFalse(output.inputs.get("Volume").links)
+        self.assertTrue(null_material.get("octanify_volume_only_material"))
+        self.assertTrue(
+            any(
+                "Volume-only Cycles graph rebuilt" in notice
+                for notice in report_data.notices
+            )
+        )
 
 
 class NormalFallbackTests(unittest.TestCase):

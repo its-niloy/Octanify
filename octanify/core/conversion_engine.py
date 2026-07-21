@@ -31,6 +31,7 @@ from .node_registry import (
     SKIP_TYPES,
     create_octane_node,
     create_node_from_candidates,
+    is_glossy_material_node,
     is_standard_surface_node,
 )
 from .gamma_system import apply_gamma
@@ -396,6 +397,10 @@ def _rebuild_links(
             to_type == "ShaderNodeBsdfPrincipled"
             and all(is_standard_surface_node(node) for node in oct_targets)
         )
+        glossy_material_target = (
+            to_type == "ShaderNodeBsdfPrincipled"
+            and all(is_glossy_material_node(node) for node in oct_targets)
+        )
 
         # Cycles feeds coordinates into Mapping, but Octane's 3D
         # Transformation has no coordinate input (its first pin is Rotation
@@ -480,6 +485,40 @@ def _rebuild_links(
                     report_data.add_approximation(
                         f"[{target_tree.name}] Principled {to_sock_name} has no "
                         "direct Standard Surface control"
+                    )
+                    continue
+            elif glossy_material_target:
+                if to_sock_name in {
+                    "Specular IOR Level",
+                    "Specular",
+                    "Sheen Weight",
+                    "Sheen",
+                    "Sheen Tint",
+                }:
+                    # Specular requires the Cycles-to-Octane scale and Sheen
+                    # requires weight × tint composition. The target-aware
+                    # Principled pass owns both graph operations.
+                    continue
+                direct_glossy_inputs = {
+                    "Base Color",
+                    "Roughness",
+                    "IOR",
+                    "Alpha",
+                    "Normal",
+                    "Anisotropic",
+                    "Anisotropic Rotation",
+                    "Sheen Roughness",
+                    "Thin Film IOR",
+                }
+                if to_sock_name not in direct_glossy_inputs:
+                    detail = (
+                        "requires nanometre-to-micrometre conversion"
+                        if to_sock_name == "Thin Film Thickness"
+                        else "has no safe direct Glossy Material socket"
+                    )
+                    report_data.add_approximation(
+                        f"[{target_tree.name}] Principled {to_sock_name} "
+                        f"{detail}; connection was not created"
                     )
                     continue
             elif to_sock_name in {
@@ -832,6 +871,23 @@ def _get_node_input_value(info, name: str, default=None):
     return default
 
 
+def _value_differs_from_default(value, default) -> bool:
+    """Compare captured scalar/color inputs without assuming an RNA type."""
+    if isinstance(value, (int, float)) and isinstance(default, (int, float)):
+        return abs(float(value) - float(default)) > 1e-6
+    if hasattr(value, "__len__") and hasattr(default, "__len__"):
+        try:
+            left = tuple(float(channel) for channel in value)
+            right = tuple(float(channel) for channel in default)
+            return any(
+                abs(channel - right[index]) > 1e-6
+                for index, channel in enumerate(left[:len(right)])
+            )
+        except (TypeError, ValueError):
+            pass
+    return value != default
+
+
 def _handle_principled_material_inputs(
     analysis: TreeAnalysis,
     node_map: dict[str, bpy.types.Node],
@@ -849,7 +905,8 @@ def _handle_principled_material_inputs(
         )
         for material_node in material_nodes:
             standard_surface = is_standard_surface_node(material_node)
-            if not standard_surface:
+            glossy_material = is_glossy_material_node(material_node)
+            if not standard_surface and not glossy_material:
                 _materialize_weighted_layer(
                     analysis, node_map, tree, graph_engine, node_name, info,
                     material_node,
@@ -858,6 +915,7 @@ def _handle_principled_material_inputs(
                     target_names=("Coating", "Coating color"),
                     label="coat",
                 )
+            if not standard_surface:
                 _materialize_weighted_layer(
                     analysis, node_map, tree, graph_engine, node_name, info,
                     material_node,
@@ -973,6 +1031,68 @@ def _handle_principled_material_inputs(
                             base_source,
                             _first_socket(material_node.inputs, (socket_name,)),
                             f"Principled {socket_name}",
+                        )
+                continue
+
+            if glossy_material:
+                # Report active constant lobes that the deliberately narrower
+                # Glossy model cannot represent. Driven versions are reported
+                # while generic links are filtered in _rebuild_links.
+                unsupported = (
+                    (("Base Weight",), 1.0, "Base Weight"),
+                    (("Metallic",), 0.0, "Metallic"),
+                    (("Transmission Weight", "Transmission"), 0.0, "Transmission"),
+                    (("Coat Weight", "Clearcoat"), 0.0, "Coat"),
+                    (("Subsurface Weight", "Subsurface"), 0.0, "Subsurface"),
+                )
+                for names, inactive_default, label in unsupported:
+                    if _incoming_link_any(analysis, node_name, names) is not None:
+                        continue
+                    value = next(
+                        (
+                            captured
+                            for name in names
+                            if (
+                                captured := _get_node_input_value(info, name)
+                            ) is not None
+                        ),
+                        inactive_default,
+                    )
+                    if _value_differs_from_default(value, inactive_default):
+                        report_data.add_approximation(
+                            f"[{tree.name}] Principled {label} is not supported "
+                            "by Octane Glossy Material"
+                        )
+
+                diffuse_roughness = _get_node_input_value(
+                    info,
+                    "Diffuse Roughness",
+                    0.0,
+                )
+                if (
+                    _incoming_link(analysis, node_name, "Diffuse Roughness") is None
+                    and isinstance(diffuse_roughness, (int, float))
+                    and diffuse_roughness > 0.0
+                ):
+                    report_data.add_approximation(
+                        f"[{tree.name}] Principled Diffuse Roughness is "
+                        "approximated by Glossy Material's Oren-Nayar model"
+                    )
+
+                specular_tint = _get_node_input_value(info, "Specular Tint")
+                if (
+                    _incoming_link(analysis, node_name, "Specular Tint") is None
+                    and specular_tint is not None
+                ):
+                    neutral_tint = (
+                        0.0
+                        if isinstance(specular_tint, (int, float))
+                        else (1.0, 1.0, 1.0, 1.0)
+                    )
+                    if _value_differs_from_default(specular_tint, neutral_tint):
+                        report_data.add_approximation(
+                            f"[{tree.name}] Principled Specular Tint is not "
+                            "supported by Octane Glossy Material"
                         )
                 continue
 
@@ -1479,6 +1599,14 @@ def _handle_emission_node_insertion(
                 break
 
         if emission_sock is None:
+            if (
+                info.bl_idname == "ShaderNodeBsdfPrincipled"
+                and is_glossy_material_node(oct_mat)
+            ):
+                report_data.add_approximation(
+                    f"[{target_tree.name}] Principled emission is not "
+                    "supported by Octane Glossy Material"
+                )
             continue
 
         # Blackbody already creates an Octane Emission-typed node.  It must
@@ -2337,6 +2465,7 @@ def convert_node_group(
     # Kept after the established positional parameters for API compatibility.
     color_nodes: bool = True,
     object_context: bpy.types.Object | None = None,
+    base_material_type: str | None = None,
 ) -> bpy.types.NodeTree | None:
     """Convert a ShaderNodeTree used by a NodeGroup."""
     if group_tree is None:
@@ -2345,6 +2474,7 @@ def convert_node_group(
     tree_name = group_tree.name
     layout_signature = "arranged" if auto_arrange else "source_layout"
     color_signature = "colored" if color_nodes else "default_color"
+    material_signature = base_material_type or "scene_material_target"
     bounds = list(getattr(object_context, "bound_box", ()) or ())
     if bounds:
         normalized_bounds = tuple(
@@ -2358,7 +2488,7 @@ def convert_node_group(
         bounds_signature = "no_object_bounds"
     cache_key = (
         f"GRP_{tree_name}_{_group_intent_signature(group_tree, intent_map)}_"
-        f"{layout_signature}_{color_signature}_{bounds_signature}"
+        f"{layout_signature}_{color_signature}_{material_signature}_{bounds_signature}"
     )
 
     if _cache.has_material(cache_key):
@@ -2409,11 +2539,13 @@ def convert_node_group(
                 auto_arrange,
                 color_nodes,
                 object_context,
+                base_material_type,
             ),
             context_name=new_tree.name,
             intent_map=intent_map,
             source_tree=group_tree,
             report_context_name=report_context_name or new_tree.name,
+            base_material_type=base_material_type,
         )
         node_map = engine.create_nodes(new_tree)
 
@@ -2722,6 +2854,7 @@ def _populate_converted_material(
     intent_map: ShadingIntentMap | None = None,
     auto_arrange: bool = True,
     color_nodes: bool = True,
+    base_material_type: str | None = None,
 ) -> list[bpy.types.Node]:
     """Build an Octane graph and return every node owned by that graph."""
     if clear_existing:
@@ -2738,12 +2871,14 @@ def _populate_converted_material(
             auto_arrange,
             color_nodes,
             obj,
+            base_material_type,
         ),
         context_name=converted.name,
         reuse_output_nodes=clear_existing,
         intent_map=intent_map,
         source_tree=original.node_tree,
         report_context_name=original.name,
+        base_material_type=base_material_type,
     )
 
     def _node_progress(completed: int, total: int, label: str) -> None:
@@ -2831,6 +2966,45 @@ def _populate_converted_material(
             seen.add(identity)
     return graph_nodes
 
+def _material_conversion_preferences(
+    base_material_type: str | None,
+    smart_material_override: bool | None,
+) -> tuple[str, bool]:
+    """Resolve one conversion pass's material preferences from Scene or API."""
+    scene = getattr(getattr(bpy, "context", None), "scene", None)
+    selected = base_material_type or getattr(
+        scene, "octanify_base_material", "STANDARD_SURFACE"
+    )
+    if selected not in {"STANDARD_SURFACE", "UNIVERSAL", "GLOSSY"}:
+        selected = "STANDARD_SURFACE"
+    override_enabled = (
+        bool(getattr(scene, "octanify_smart_material_override", False))
+        if smart_material_override is None
+        else bool(smart_material_override)
+    )
+    return selected, override_enabled
+
+
+def _effective_material_target(
+    material_name: str,
+    intent_map: ShadingIntentMap,
+    selected_target: str,
+    smart_material_override: bool,
+) -> str:
+    """Apply the explicit SSS target override to one material, if eligible."""
+    if (
+        smart_material_override
+        and selected_target != "STANDARD_SURFACE"
+        and intent_map.has_active_principled_subsurface()
+    ):
+        report_data.add_notice(
+            f"[{material_name}] Subsurface detected, converted to Standard "
+            "Surface (override enabled)"
+        )
+        return "STANDARD_SURFACE"
+    return selected_target
+
+
 def convert_material(
     mat: bpy.types.Material,
     gamma_value: float = 2.2,
@@ -2839,6 +3013,8 @@ def convert_material(
     auto_arrange: bool = True,
     progress_callback: Callable[[float, str], None] | None = None,
     color_nodes: bool = True,
+    base_material_type: str | None = None,
+    smart_material_override: bool | None = None,
 ) -> bpy.types.Material | None:
     """
     Convert a single Cycles material to Octane.
@@ -2884,6 +3060,15 @@ def convert_material(
         intent_map = trace_shading_intent(
             _selected_material_output(mat.node_tree)
         )
+        selected_target, override_enabled = _material_conversion_preferences(
+            base_material_type, smart_material_override
+        )
+        effective_target = _effective_material_target(
+            mat_name,
+            intent_map,
+            selected_target,
+            override_enabled,
+        )
         _apply_intent_flags(analysis, intent_map, mat.node_tree)
         if smart_conversion:
             new_mat = mat
@@ -2899,6 +3084,7 @@ def convert_material(
                 intent_map=intent_map,
                 auto_arrange=auto_arrange,
                 color_nodes=color_nodes,
+                base_material_type=effective_target,
             )
             style_smart_graphs(
                 mat.node_tree,
@@ -2923,6 +3109,7 @@ def convert_material(
                 intent_map=intent_map,
                 auto_arrange=auto_arrange,
                 color_nodes=color_nodes,
+                base_material_type=effective_target,
             )
             style_converted_graph(
                 new_mat.node_tree,
@@ -2935,6 +3122,7 @@ def convert_material(
             new_mat["octanify_source_material"] = mat_name
             new_mat["octanify_converted"] = True
             new_mat["octanify_smart_conversion"] = smart_conversion
+            new_mat["octanify_material_target"] = effective_target
         except (AttributeError, TypeError):
             pass
         if progress_callback is not None:
@@ -2960,6 +3148,8 @@ def convert_material(
                     del mat["octanify_converted"]
                 if "octanify_smart_conversion" in mat:
                     del mat["octanify_smart_conversion"]
+                if "octanify_material_target" in mat:
+                    del mat["octanify_material_target"]
             except (AttributeError, KeyError, TypeError):
                 pass
         elif new_mat is not None:
@@ -3173,6 +3363,8 @@ def convert_objects_materials(
     progress_callback: Callable[[int, int, str], None] | None = None,
     reset_conversion_cache: bool = True,
     color_nodes: bool = True,
+    base_material_type: str | None = None,
+    smart_material_override: bool | None = None,
 ) -> list[bpy.types.Material]:
     """Convert discovered materials across a deterministic object collection."""
     if reset_conversion_cache:
@@ -3207,6 +3399,8 @@ def convert_objects_materials(
             auto_arrange=auto_arrange,
             color_nodes=color_nodes,
             progress_callback=_material_progress,
+            base_material_type=base_material_type,
+            smart_material_override=smart_material_override,
         )
         if new_mat is not None:
             if slot is not None:
@@ -3235,6 +3429,8 @@ def convert_scene_materials(
     auto_arrange: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
     color_nodes: bool = True,
+    base_material_type: str | None = None,
+    smart_material_override: bool | None = None,
 ) -> list[bpy.types.Material]:
     """Convert all Cycles materials across all objects in the scene."""
     objects = list(bpy.context.scene.objects)
@@ -3246,4 +3442,6 @@ def convert_scene_materials(
         color_nodes=color_nodes,
         progress_callback=progress_callback,
         reset_conversion_cache=True,
+        base_material_type=base_material_type,
+        smart_material_override=smart_material_override,
     )

@@ -10,7 +10,12 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any
 
-from .node_registry import INPUT_MAP, MATH_OPERATION_MAP, is_standard_surface_node
+from .node_registry import (
+    INPUT_MAP,
+    MATH_OPERATION_MAP,
+    is_glossy_material_node,
+    is_standard_surface_node,
+)
 from ..utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -255,6 +260,8 @@ def _transfer_principled(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Map Principled BSDF using the semantics of the actual target node."""
     if is_standard_surface_node(node):
         _transfer_principled_standard_surface(info, node)
+    elif is_glossy_material_node(node):
+        _transfer_principled_glossy(info, node)
     else:
         _transfer_principled_universal(info, node)
 
@@ -428,6 +435,70 @@ def _transfer_principled_universal(info: "NodeInfo", node: "bpy.types.Node") -> 
         tw = _get_input_value(info, "Transmission")
     if isinstance(tw, (int, float)):
         _set_input(node, ["Transmission float"], tw)
+
+
+def _transfer_principled_glossy(info: "NodeInfo", node: "bpy.types.Node") -> None:
+    """Map the compatible Principled lobes to Octane Glossy Material.
+
+    Glossy is intentionally narrower than Principled. Unsupported lobes are
+    kept out of unrelated sockets by the graph rebuild pass and reported as
+    approximations there.
+    """
+    _set_input(node, ["BRDF model"], "GGX")
+
+    direct_transfers = (
+        ("Base Color", ("Diffuse",)),
+        ("Roughness", ("Roughness",)),
+        ("IOR", ("Index of refraction", "Index", "IOR")),
+        ("Alpha", ("Opacity",)),
+        ("Anisotropic", ("Anisotropy",)),
+        ("Anisotropic Rotation", ("Rotation",)),
+    )
+    for cycles_name, octane_names in direct_transfers:
+        value = _get_input_value(info, cycles_name)
+        if value is not None:
+            _set_input(node, list(octane_names), value)
+
+    specular_level = _get_input_value(info, "Specular IOR Level")
+    if specular_level is None:
+        specular_level = _get_input_value(info, "Specular")
+    if isinstance(specular_level, (int, float)):
+        _set_input(node, ["Specular"], specular_level * 2.0)
+
+    diffuse_roughness = _get_input_value(info, "Diffuse Roughness", 0.0)
+    if isinstance(diffuse_roughness, (int, float)) and diffuse_roughness > 0.0:
+        # Glossy exposes the diffuse model but not Cycles' continuously
+        # variable diffuse-roughness amount.
+        _set_input(node, ["Diffuse BRDF model"], "Oren-Nayar")
+    else:
+        _set_input(node, ["Diffuse BRDF model"], "Lambertian")
+
+    sheen_weight = _get_input_value(info, "Sheen Weight")
+    if sheen_weight is None:
+        sheen_weight = _get_input_value(info, "Sheen", 0.0)
+    sheen_tint = _get_input_value(
+        info,
+        "Sheen Tint",
+        (1.0, 1.0, 1.0, 1.0),
+    )
+    _set_input(node, ["Sheen"], _weighted_color(sheen_tint, sheen_weight))
+    if isinstance(sheen_weight, (int, float)) and sheen_weight > 0.0:
+        _set_input(
+            node,
+            ["Sheen Roughness"],
+            _get_input_value(info, "Sheen Roughness", 0.5),
+        )
+
+    film_width_nm = _get_input_value(info, "Thin Film Thickness", 0.0)
+    if isinstance(film_width_nm, (int, float)) and film_width_nm > 0.0:
+        # Blender exposes nanometres; Octane Glossy 31.9 labels this socket
+        # explicitly in micrometres.
+        _set_input(node, ["Film width (um)"], film_width_nm / 1000.0)
+        _set_input(
+            node,
+            ["Film IOR"],
+            _get_input_value(info, "Thin Film IOR", 1.33),
+        )
 
 
 def _transfer_glass(info: "NodeInfo", node: "bpy.types.Node") -> None:
@@ -1107,12 +1178,23 @@ def _transfer_color_ramp(info: "NodeInfo", node: "bpy.types.Node") -> None:
         except (TypeError, AttributeError):
             pass
 
+OCTANE_MEDIUM_DENSITY_SCALE = 100.0
+
+
+def _scaled_medium_density(value):
+    """Map Cycles' unit density to Octane's 100-based homogeneous scale."""
+    try:
+        return float(value) * OCTANE_MEDIUM_DENSITY_SCALE
+    except (TypeError, ValueError):
+        return value
+
+
 def _transfer_volume_absorption(info: "NodeInfo", node: "bpy.types.Node") -> None:
     """Volume Absorption → Octane Absorption Medium."""
     _set_input(node, ["Absorption", "Color"],
                _get_input_value(info, "Color", (0.8, 0.8, 0.8, 1.0)))
     _set_input(node, ["Density", "Density float"],
-               _get_input_value(info, "Density", 1.0))
+               _scaled_medium_density(_get_input_value(info, "Density", 1.0)))
 
 
 def _transfer_volume_scatter(info: "NodeInfo", node: "bpy.types.Node") -> None:
@@ -1120,7 +1202,7 @@ def _transfer_volume_scatter(info: "NodeInfo", node: "bpy.types.Node") -> None:
     _set_input(node, ["Scattering", "Color"],
                _get_input_value(info, "Color", (0.8, 0.8, 0.8, 1.0)))
     _set_input(node, ["Density", "Density float"],
-               _get_input_value(info, "Density", 1.0))
+               _scaled_medium_density(_get_input_value(info, "Density", 1.0)))
     _set_input(node, ["Phase", "Anisotropy"],
                _get_input_value(info, "Anisotropy", 0.0))
 
@@ -1204,8 +1286,9 @@ def _transfer_rgb_to_bw(info: "NodeInfo", node: "bpy.types.Node") -> None:
 
 
 def _transfer_volume_principled(info: "NodeInfo", node: "bpy.types.Node") -> None:
-    _set_input(node, ["Absorption", "Color"], _get_input_value(info, "Color", (1,1,1,1)))
-    _set_input(node, ["Density", "Density float"], _get_input_value(info, "Density", 1.0))
+    _set_input(node, ["Scattering", "Color"], _get_input_value(info, "Color", (1,1,1,1)))
+    _set_input(node, ["Absorption", "Absorption color"], _get_input_value(info, "Absorption Color", (0,0,0,1)))
+    _set_input(node, ["Density", "Density float"], _scaled_medium_density(_get_input_value(info, "Density", 1.0)))
     _set_input(node, ["Phase", "Anisotropy"], _get_input_value(info, "Anisotropy", 0.0))
     _set_input(node, ["Emission", "Emission color"], _get_input_value(info, "Emission Color", (0,0,0,1)))
     _set_input(node, ["Emission power", "Power"], _get_input_value(info, "Emission Strength", 0.0))

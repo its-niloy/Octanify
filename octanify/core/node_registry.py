@@ -12,10 +12,56 @@ STANDARD_SURFACE_NODE_TYPES = frozenset({
     "ShaderNodeOctStandardSurfaceMat",
 })
 
+GLOSSY_MATERIAL_NODE_TYPES = frozenset({
+    "OctaneGlossyMaterial",
+    "ShaderNodeOctGlossyMat",
+})
+
+PRINCIPLED_MATERIAL_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "STANDARD_SURFACE": (
+        "OctaneStandardSurfaceMaterial",
+        "ShaderNodeOctStandardSurfaceMat",
+    ),
+    "UNIVERSAL": (
+        "OctaneUniversalMaterial",
+        "ShaderNodeOctUniversalMat",
+    ),
+    "GLOSSY": (
+        "OctaneGlossyMaterial",
+        "ShaderNodeOctGlossyMat",
+    ),
+}
+
 
 def is_standard_surface_node(node) -> bool:
     """Return whether *node* is an Octane Standard Surface material."""
     return getattr(node, "bl_idname", "") in STANDARD_SURFACE_NODE_TYPES
+
+
+def is_glossy_material_node(node) -> bool:
+    """Return whether *node* is an Octane Glossy material."""
+    return getattr(node, "bl_idname", "") in GLOSSY_MATERIAL_NODE_TYPES
+
+
+def principled_material_candidates(material_type: str | None = None) -> list[str]:
+    """Return exact Octane candidates for the selected Principled target."""
+    if material_type is None:
+        material_type = "STANDARD_SURFACE"
+        try:
+            import bpy
+            material_type = getattr(
+                bpy.context.scene,
+                "octanify_base_material",
+                material_type,
+            )
+        except Exception:
+            pass
+    return list(
+        PRINCIPLED_MATERIAL_CANDIDATES.get(
+            material_type,
+            PRINCIPLED_MATERIAL_CANDIDATES["STANDARD_SURFACE"],
+        )
+    )
 
 # ---------------------------------------------------------------------------
 # Node type map: Cycles bl_idname → list of Octane bl_idname candidates
@@ -33,8 +79,8 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneSpecularMaterial",
     ],
     "ShaderNodeBsdfGlossy": [
-        "ShaderNodeOctGlossyMat",
         "OctaneGlossyMaterial",
+        "ShaderNodeOctGlossyMat",
     ],
     "ShaderNodeBsdfDiffuse": [
         "ShaderNodeOctDiffuseMat",
@@ -382,9 +428,11 @@ NODE_TYPE_MAP: dict[str, list[str]] = {
         "OctaneScatteringMedium",
     ],
     "ShaderNodeVolumePrincipled": [
+        "OctaneScattering",
+        "ShaderNodeOctScatterMedium",
+        "OctaneScatteringMedium",
         "ShaderNodeOctVolumeMedium",
         "OctaneVolumeMedium",
-        "ShaderNodeOctAbsorptionMedium",
     ],
     "ShaderNodeVolumeInfo": [
         "ShaderNodeOctFloatTex",
@@ -590,7 +638,7 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Specular IOR Level":   ["Specular weight", "Specular", "Specular float"],
         "Specular":             ["Specular weight", "Specular", "Specular float"],
         "Specular Tint":        ["Specular color"],
-        "IOR":                  ["Dielectric IOR", "Index", "IOR", "Specular IOR"],
+        "IOR":                  ["Dielectric IOR", "Index of refraction", "Index", "IOR", "Specular IOR"],
         "Transmission Weight":  ["Transmission weight", "Transmission", "Transmission float"],
         "Transmission":         ["Transmission weight", "Transmission", "Transmission float"],
         "Alpha":                ["Opacity", "Opacity float"],
@@ -619,7 +667,7 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Subsurface Radius":    ["Subsurface radius"],
         "Subsurface Scale":     ["Subsurface scale"],
         "Subsurface Anisotropy": ["Subsurface anisotropy"],
-        "Thin Film Thickness":  ["Film thickness (nm)", "Film width", "Thin film thickness"],
+        "Thin Film Thickness":  ["Film thickness (nm)", "Film width (um)", "Film width", "Thin film thickness"],
         "Thin Film IOR":        ["Film IOR", "Thin film IOR"],
     },
     "ShaderNodeBsdfGlass": {
@@ -867,7 +915,8 @@ INPUT_MAP: dict[str, dict[str, list[str]]] = {
         "Temperature": ["Temperature"],
     },
     "ShaderNodeVolumePrincipled": {
-        "Color":            ["Absorption", "Color"],
+        "Color":            ["Scattering", "Color"],
+        "Absorption Color": ["Absorption", "Absorption color"],
         "Density":          ["Density", "Density float"],
         "Anisotropy":       ["Phase", "Anisotropy"],
         "Emission Color":   ["Emission", "Emission color"],
@@ -1418,6 +1467,7 @@ def create_octane_node(
     cycles_type: str,
     label: str = "",
     preferred_candidates: list[str] | None = None,
+    base_material_type: str | None = None,
 ):
     """Try to create an Octane node using candidates list. Returns node or None."""
     from ..utils.logger import get_logger
@@ -1435,11 +1485,22 @@ def create_octane_node(
     try:
         scene = bpy.context.scene
         if cycles_type == "ShaderNodeBsdfPrincipled":
-            if getattr(scene, "octanify_base_material", "STANDARD_SURFACE") == "STANDARD_SURFACE":
-                candidates = [
-                    "OctaneStandardSurfaceMaterial",
-                    "ShaderNodeOctStandardSurfaceMat",
-                ] + candidates
+            material_type = base_material_type or getattr(
+                scene, "octanify_base_material", "STANDARD_SURFACE"
+            )
+            selected = principled_material_candidates(material_type)
+            if material_type == "GLOSSY":
+                # A requested Glossy conversion must never silently become a
+                # Universal or Standard Surface material. If neither installed
+                # Glossy identifier exists, normal unsupported-node reporting
+                # owns the failure.
+                candidates = selected
+            else:
+                candidates = selected + [
+                    candidate
+                    for candidate in candidates
+                    if candidate not in selected
+                ]
 
         elif cycles_type == "ShaderNodeDisplacement":
             if getattr(scene, "octanify_disp_mode", "TEXTURE") == "VERTEX":

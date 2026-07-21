@@ -53,6 +53,7 @@ class GraphEngine:
         intent_map: ShadingIntentMap | None = None,
         source_tree=None,
         report_context_name: str = "",
+        base_material_type: str | None = None,
     ) -> None:
         self.analysis = analysis
         self.group_converter_cb = group_converter_cb
@@ -61,6 +62,7 @@ class GraphEngine:
         self.reuse_output_nodes = reuse_output_nodes
         self.intent_map = intent_map
         self.source_tree = source_tree
+        self.base_material_type = base_material_type
         # Ordered list of node names to convert (dependencies first)
         self._schedule: list[str] = []
         self._visited: set[str] = set()
@@ -999,6 +1001,7 @@ class GraphEngine:
             cycles_type,
             label=f"{info.label} [Data]",
             preferred_candidates=preferred_candidates,
+            base_material_type=self.base_material_type,
         )
         if data_node is None:
             from .report import report_data
@@ -1141,6 +1144,7 @@ class GraphEngine:
                 bl_id,
                 label=info.label,
                 preferred_candidates=preferred_candidates,
+                base_material_type=self.base_material_type,
             )
 
             if new_node is not None:
