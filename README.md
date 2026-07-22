@@ -1,23 +1,56 @@
+<div align="center">
+
+# 🧪 O C T A N I F Y
+
+```text
+     ██████╗  ██████╗████████╗ █████╗ ███╗   ██╗██╗███████╗██╗   ██╗
+    ██╔═══██╗██╔════╝╚══██╔══╝██╔══██╗████╗  ██║██║██╔════╝╚██╗ ██╔╝
+    ██║   ██║██║        ██║   ███████║██╔██╗ ██║██║█████╗   ╚████╔╝
+    ██║   ██║██║        ██║   ██╔══██║██║╚██╗██║██║██╔══╝    ╚██╔╝
+    ╚██████╔╝╚██████╗   ██║   ██║  ██║██║ ╚████║██║██║        ██║
+     ╚═════╝  ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝╚═╝        ╚═╝
+```
+
+**One-click Cycles → Octane scene conversion for Blender**
+
 <p align="center">
-  <h1 align="center">Octanify</h1>
-  <p align="center">
-    <strong>One-click Cycles → Octane scene conversion for Blender</strong>
-  </p>
-  <p align="center">
-    <a href="#the-interface">Interface</a> •
-    <a href="#features">Features</a> •
-    <a href="#workflow-utilities">Utilities</a> •
-    <a href="#how-it-works">How It Works</a> •
-    <a href="#supported-nodes">Supported Nodes</a> •
-    <a href="#installation">Installation</a>
-  </p>
+  <a href="#"><img src="https://img.shields.io/badge/Version-1.4.0-orange?style=for-the-badge&logo=blender"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Release%20Size-138%20KB-FF8C00?style=for-the-badge&logo=files"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0--or--later-blue?style=for-the-badge"></a>
+  <br>
+  <a href="#"><img src="https://img.shields.io/badge/Blender-4.2%2B-F5792A?style=for-the-badge&logo=blender"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Runtime%20Verified-Blender%205.1%20%2B%20Octane%2031.9-green?style=for-the-badge"></a>
 </p>
+
+[**Interface**](#the-interface) • [**Features**](#features) • [**How It Works**](#how-it-works) • [**Supported Nodes**](#supported-nodes) • [**Installation**](#installation)
+
+</div>
 
 ---
 
 **Octanify** is a production-grade Blender addon that intelligently translates complex Cycles materials, supported lights, and World environments into high-fidelity Octane equivalents. It preserves shader intent, texture chains, procedural structure, and the original Cycles renderer branches with a single click.
 
 > Convert supported branches without routine rewiring, preserve the Cycles source, and inspect approximations or fallbacks in one structured report.
+
+---
+
+## 📑 Table of Contents
+
+- [🖥️ The Interface](#the-interface)
+- [📖 How to Use Octanify](#how-to-use-octanify)
+- [✨ Features](#features)
+- [🎨 Destination-Aware Texture Intent](#destination-aware-texture-intent)
+- [🛠️ Workflow Utilities](#workflow-utilities)
+- [⚙️ How It Works](#how-it-works)
+- [🔌 Supported Nodes](#supported-nodes)
+- [📁 Project Structure](#project-structure)
+  - [Validation](#validation)
+- [📥 Installation](#installation)
+  - [Blender 4.2+](#blender-42)
+  - [Requirements](#requirements)
+  - [Runtime-verified configuration and compatibility note](#runtime-verified-configuration-and-compatibility-note)
+- [🙏 Credits](#credits)
+- [License](#license)
 
 ---
 
