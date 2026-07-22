@@ -1,15 +1,6 @@
 <div align="center">
 
-# 🧪 O C T A N I F Y
-
-```text
-   ____       __              _ ____
-  / __ \_____/ /_____ _____  (_) __/_  __
- / / / / ___/ __/ __ `/ __ \/ / /_/ / / /
-/ /_/ / /__/ /_/ /_/ / / / / / __/ /_/ /
-\____/\___/\__/\__,_/_/ /_/_/_/  \__, /
-                                 /____/
-```
+<h1>🧪 O C T A N I F Y</h1>
 
 **One-click Cycles → Octane scene conversion for Blender**
 
