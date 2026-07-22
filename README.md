@@ -362,6 +362,7 @@ Octanify/
         ├── blender_validate_phase4.py   # Composite layers and procedural-scale runtime checks
         ├── blender_validate_phase5.py   # Target selection, SSS, displacement, and volume checks
         ├── blender_validate_glossy_material.py # Glossy Material runtime checks
+        ├── blender_validate_node_groups.py # Operator-level nested shader-group checks
         ├── blender_probe_bootstrap.py   # Bootstraps Octane material probes
         └── blender_inspect_octane_nodes.py # Inspects installed Octane node definitions
 ```
@@ -370,7 +371,7 @@ The clean release archive contains the license and runtime add-on files: `LICENS
 
 ### Validation
 
-The repository currently passes 150 Python regression tests. Node-RNA-sensitive paths have also been exercised in Blender 5.1 with OctaneRender for Blender 31.9, including Composite Texture layers, Cinema 4D procedural scale matching at 1 m, 2 m, and 5 m object sizes, exact Texture/Vertex displacement selection, Glossy target mapping, smart SSS overrides, medium-density/topology reconstruction, nested-frame arrangement, disabled custom coloring, renderer-targeted Light outputs, preserved World outputs, and Octane active-output resolution. These checks validate graph structure and parameter transfer; renderer-to-renderer pixel equivalence still requires matched reference renders, as described in [`octanify/MATERIAL_FIDELITY.md`](octanify/MATERIAL_FIDELITY.md).
+The repository currently passes 151 Python regression tests. Node-RNA-sensitive paths have also been exercised in Blender 5.1 with OctaneRender for Blender 31.9, including Composite Texture layers, Cinema 4D procedural scale matching at 1 m, 2 m, and 5 m object sizes, exact Texture/Vertex displacement selection, Glossy target mapping, smart SSS overrides, medium-density/topology reconstruction, one-level and three-level shader groups through the real conversion operator, nested-frame arrangement, disabled custom coloring, renderer-targeted Light outputs, preserved World outputs, and Octane active-output resolution. These checks validate graph structure and parameter transfer; renderer-to-renderer pixel equivalence still requires matched reference renders, as described in [`octanify/MATERIAL_FIDELITY.md`](octanify/MATERIAL_FIDELITY.md).
 
 ---
 

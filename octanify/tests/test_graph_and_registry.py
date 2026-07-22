@@ -62,6 +62,7 @@ from octanify.core.conversion_engine import (
     _specialize_bbox_relative_materials,
     collect_material_work_items,
     convert_material,
+    convert_node_group,
     convert_objects_materials,
     reset_cache,
 )
@@ -4241,6 +4242,26 @@ class ConversionLifecycleTests(unittest.TestCase):
         self.assertIsNone(converted)
         self.assertEqual(len(removed), 1)
         self.assertIn("rolled back", report_data.warnings[0])
+        self.assertRegex(
+            report_data.warnings[0],
+            r"Traceback: .*:\d+ in ",
+        )
+
+    def test_group_failure_warning_includes_traceback_frames(self) -> None:
+        group_tree = SimpleNamespace(name="Broken Group")
+
+        with patch(
+            "octanify.core.conversion_engine.analyze_tree",
+            side_effect=RuntimeError("broken group fixture"),
+        ):
+            converted = convert_node_group(group_tree)
+
+        self.assertIsNone(converted)
+        self.assertIn("[Group: Broken Group] Conversion failed", report_data.warnings[0])
+        self.assertRegex(
+            report_data.warnings[0],
+            r"Traceback: .*:\d+ in ",
+        )
 
     def test_smart_conversion_keeps_the_original_material_datablock(self) -> None:
         class _Material(dict):

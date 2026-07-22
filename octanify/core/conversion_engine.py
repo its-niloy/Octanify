@@ -17,6 +17,7 @@ single Cycles material into an Octane material:
 from __future__ import annotations
 
 import hashlib
+import traceback
 from typing import TYPE_CHECKING, Callable, Iterable
 
 import bpy
@@ -52,6 +53,30 @@ if TYPE_CHECKING:
     pass
 
 log = get_logger()
+
+
+def _traceback_frame_summary(
+    formatted_traceback: str,
+    frame_limit: int = 3,
+) -> str:
+    """Return compact traceback frames suitable for a one-line UI warning."""
+    frames: list[str] = []
+    for line in formatted_traceback.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith('File "'):
+            continue
+        filename_part, separator, location_part = stripped.partition('", line ')
+        if not separator:
+            continue
+        line_number, separator, function_name = location_part.partition(", in ")
+        if not separator:
+            continue
+        filename = filename_part[len('File "'):].replace("\\", "/")
+        filename = filename.rsplit("/", 1)[-1]
+        frames.append(f"{filename}:{line_number} in {function_name}")
+    if not frames:
+        return ""
+    return " | Traceback: " + " <- ".join(frames[-max(1, frame_limit):])
 
 
 # ---------------------------------------------------------------------------
@@ -2625,7 +2650,10 @@ def convert_node_group(
         return new_tree
     except Exception as exc:
         message = f"[Group: {tree_name}] Conversion failed: {exc}"
-        report_data.add_warning(message)
+        formatted_traceback = traceback.format_exc()
+        report_data.add_warning(
+            message + _traceback_frame_summary(formatted_traceback)
+        )
         log.error(message, exc_info=True)
         if new_tree is not None:
             try:
@@ -3129,7 +3157,10 @@ def convert_material(
             progress_callback(1.0, f"Completed {mat_name}")
     except Exception as exc:
         message = f"[{mat_name}] Conversion failed and was rolled back: {exc}"
-        report_data.add_warning(message)
+        formatted_traceback = traceback.format_exc()
+        report_data.add_warning(
+            message + _traceback_frame_summary(formatted_traceback)
+        )
         log.error(message, exc_info=True)
         if progress_callback is not None:
             progress_callback(1.0, f"Failed {mat_name}")
