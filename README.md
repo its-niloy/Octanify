@@ -5,7 +5,7 @@
 **One-click Cycles → Octane scene conversion for Blender**
 
 <p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/Version-1.4.0-orange?style=for-the-badge&logo=blender"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Version-1.4.1-orange?style=for-the-badge&logo=blender"></a>
   <a href="#"><img src="https://img.shields.io/badge/Release%20Size-138%20KB-FF8C00?style=for-the-badge&logo=files"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0--or--later-blue?style=for-the-badge"></a>
   <br>
