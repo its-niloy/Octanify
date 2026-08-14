@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import bpy
 
@@ -319,6 +320,58 @@ def _exercise_cycles_cleanup(materials: list[bpy.types.Material]) -> dict:
     }
 
 
+def _exercise_automatic_cycles_cleanup() -> dict:
+    """Verify the unchecked conversion option removes only the source graph."""
+    scene = bpy.context.scene
+    mesh = bpy.data.meshes.new("OCTANIFY_AUTO_CLEANUP_MESH")
+    mesh.from_pydata(
+        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+        [],
+        [(0, 1, 2)],
+    )
+    mesh.update()
+    obj = bpy.data.objects.new("OCTANIFY_AUTO_CLEANUP_OBJECT", mesh)
+    scene.collection.objects.link(obj)
+    material = bpy.data.materials.new("OCTANIFY_AUTO_CLEANUP_MATERIAL")
+    material.use_nodes = True
+    mesh.materials.append(material)
+
+    previous_batch_mode = scene.octanify_batch_mode
+    previous_keep_cycles = scene.octanify_keep_cycles_nodes
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    try:
+        scene.octanify_batch_mode = "ACTIVE"
+        scene.octanify_keep_cycles_nodes = False
+        operator_result = sorted(bpy.ops.octanify.convert())
+    finally:
+        scene.octanify_batch_mode = previous_batch_mode
+        scene.octanify_keep_cycles_nodes = previous_keep_cycles
+
+    tree = material.node_tree
+    cycles_after = sum(
+        node.get("octanify_graph", "") == "cycles"
+        for node in tree.nodes
+    )
+    octane_nodes = [
+        node for node in tree.nodes
+        if node.get("octanify_graph", "") == "octane"
+    ]
+    octane_output_active = any(
+        node.bl_idname == "ShaderNodeOutputMaterial"
+        and bool(getattr(node, "is_active_output", False))
+        for node in octane_nodes
+    )
+    return {
+        "operator_result": operator_result,
+        "cycles_after": cycles_after,
+        "octane_nodes_after": len(octane_nodes),
+        "octane_output_active": octane_output_active,
+        "converted": bool(material.get("octanify_converted", False)),
+    }
+
+
 def main() -> None:
     args = _args()
     hierarchy_parent = bpy.data.objects.new("OCTANIFY_FIXTURE_hierarchy_root", None)
@@ -334,13 +387,26 @@ def main() -> None:
 
     bpy.context.scene.octanify_batch_mode = "ALL"
     bpy.context.scene.octanify_base_material = "STANDARD_SURFACE"
+    keep_cycles_default = bool(
+        bpy.context.scene.octanify_keep_cycles_nodes
+    )
+    conversion_started = time.perf_counter()
     result = bpy.ops.octanify.convert()
+    conversion_seconds = time.perf_counter() - conversion_started
     if "FINISHED" not in result:
         raise SystemExit("Octanify conversion operator did not finish")
 
     from octanify.core.report import report_data
 
-    auto_connect = _exercise_auto_connect()
+    conversion_report = {
+        "materials_converted": report_data.materials_converted,
+        "nodes_translated": report_data.nodes_translated,
+        "nodes_unsupported": report_data.nodes_unsupported,
+        "links_created": report_data.links_created,
+        "links_failed": report_data.links_failed,
+        "approximations": list(report_data.approximations),
+        "warnings": list(report_data.warnings),
+    }
 
     materials = [
         material for material in bpy.data.materials
@@ -348,20 +414,29 @@ def main() -> None:
         and bool(material.get("octanify_converted", False))
     ]
     results = [_material_result(material) for material in materials]
+    auto_connect = _exercise_auto_connect()
+    automatic_cycles_cleanup = _exercise_automatic_cycles_cleanup()
     cycles_cleanup = _exercise_cycles_cleanup(materials)
+    try:
+        import octane
+        octane_version = getattr(octane, "OCTANE_BLENDER_VERSION", "unknown")
+        octane_sdk_version = getattr(octane, "OCTANE_SDK_VERSION", "unknown")
+    except ImportError:
+        octane_version = "unavailable"
+        octane_sdk_version = "unavailable"
     payload = {
-        "materials": results,
-        "report": {
-            "materials_converted": report_data.materials_converted,
-            "nodes_translated": report_data.nodes_translated,
-            "nodes_unsupported": report_data.nodes_unsupported,
-            "links_created": report_data.links_created,
-            "links_failed": report_data.links_failed,
-            "approximations": list(report_data.approximations),
-            "warnings": list(report_data.warnings),
+        "runtime": {
+            "blender_version": ".".join(map(str, bpy.app.version)),
+            "octane_addon_version": octane_version,
+            "octane_sdk_version": octane_sdk_version,
+            "conversion_seconds": round(conversion_seconds, 6),
         },
+        "materials": results,
+        "report": conversion_report,
         "hierarchy_selection_ok": hierarchy_ok,
         "auto_connect": auto_connect,
+        "keep_cycles_default": keep_cycles_default,
+        "automatic_cycles_cleanup": automatic_cycles_cleanup,
         "cycles_cleanup": cycles_cleanup,
         "progress": bpy.context.scene.octanify_progress,
         "progress_widget": (
@@ -386,6 +461,27 @@ def main() -> None:
         failures.append(f"auto-connect missed Octane displacement: {auto_connect}")
     if not auto_connect["cycles_untouched"]:
         failures.append(f"auto-connect modified the Cycles graph: {auto_connect}")
+    if not keep_cycles_default:
+        failures.append("Keep Original Cycles Nodes was not checked by default")
+    if automatic_cycles_cleanup["operator_result"] != ["FINISHED"]:
+        failures.append(
+            "automatic Cycles cleanup conversion did not finish: "
+            f"{automatic_cycles_cleanup}"
+        )
+    if automatic_cycles_cleanup["cycles_after"] != 0:
+        failures.append(
+            "unchecked conversion retained tagged Cycles nodes: "
+            f"{automatic_cycles_cleanup}"
+        )
+    if (
+        not automatic_cycles_cleanup["converted"]
+        or automatic_cycles_cleanup["octane_nodes_after"] == 0
+        or not automatic_cycles_cleanup["octane_output_active"]
+    ):
+        failures.append(
+            "unchecked conversion damaged the Octane graph: "
+            f"{automatic_cycles_cleanup}"
+        )
     if cycles_cleanup["operator_result"] != ["FINISHED"]:
         failures.append(f"Cycles cleanup operator did not finish: {cycles_cleanup}")
     if cycles_cleanup["cycles_before"] == 0 or cycles_cleanup["cycles_after"] != 0:

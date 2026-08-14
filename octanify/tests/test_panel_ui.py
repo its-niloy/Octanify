@@ -20,6 +20,7 @@ def _install_bpy_stub() -> None:
                 "Operator",
                 "Panel",
                 "Scene",
+                "ShaderNodeTree",
                 "UILayout",
             )
         }
@@ -36,6 +37,7 @@ def _install_bpy_stub() -> None:
         unregister_class=lambda _cls: None,
     )
     bpy.context = SimpleNamespace(scene=SimpleNamespace())
+    bpy.app = SimpleNamespace(version=(5, 2, 0))
     sys.modules["bpy"] = bpy
 
 
@@ -52,6 +54,10 @@ from octanify.ui.panel import (  # noqa: E402
     classes,
 )
 from octanify.core.report import report_data  # noqa: E402
+from octanify import (  # noqa: E402
+    _register_octane_output_compatibility,
+    _unregister_octane_output_compatibility,
+)
 
 
 class _RecordingLayout:
@@ -99,6 +105,7 @@ def _scene(**overrides):
         "octanify_albedo_gamma": 2.2,
         "octanify_auto_arrange": True,
         "octanify_color_nodes": True,
+        "octanify_keep_cycles_nodes": True,
         "octanify_progress": 0,
         "octanify_progress_label": "Ready",
         "octanify_progress_active": False,
@@ -110,6 +117,43 @@ def _scene(**overrides):
 class PanelHierarchyTests(unittest.TestCase):
     def tearDown(self) -> None:
         report_data.clear()
+
+    def test_blender_52_registers_and_owns_octane_output_compatibility(self) -> None:
+        bpy_module = sys.modules["bpy"]
+        had_shader_tree = hasattr(bpy_module.types, "ShaderNodeTree")
+        shader_tree_type = getattr(
+            bpy_module.types,
+            "ShaderNodeTree",
+            type("ShaderNodeTree", (), {}),
+        )
+        bpy_module.types.ShaderNodeTree = shader_tree_type
+        original_app = getattr(bpy_module, "app", None)
+        bpy_module.app = SimpleNamespace(version=(5, 2, 0))
+        had_string_property = hasattr(bpy_module.props, "StringProperty")
+        original_string_property = getattr(
+            bpy_module.props, "StringProperty", None
+        )
+        bpy_module.props.StringProperty = lambda **_kwargs: None
+        if hasattr(shader_tree_type, "active_output_name"):
+            delattr(shader_tree_type, "active_output_name")
+
+        try:
+            _register_octane_output_compatibility()
+            self.assertTrue(hasattr(shader_tree_type, "active_output_name"))
+
+            _unregister_octane_output_compatibility()
+            self.assertFalse(hasattr(shader_tree_type, "active_output_name"))
+        finally:
+            if original_app is None:
+                delattr(bpy_module, "app")
+            else:
+                bpy_module.app = original_app
+            if had_string_property:
+                bpy_module.props.StringProperty = original_string_property
+            else:
+                delattr(bpy_module.props, "StringProperty")
+            if not had_shader_tree:
+                delattr(bpy_module.types, "ShaderNodeTree")
 
     def test_primary_action_precedes_compact_conversion_choices(self) -> None:
         layout = _RecordingLayout()
@@ -132,6 +176,19 @@ class PanelHierarchyTests(unittest.TestCase):
         )
 
         self.assertLess(operator_index, scope_index)
+        preservation_index = next(
+            index
+            for index, event in enumerate(layout.events)
+            if event[0] == "prop"
+            and event[1] == "octanify_keep_cycles_nodes"
+        )
+        self.assertLess(operator_index, preservation_index)
+        self.assertLess(preservation_index, scope_index)
+        self.assertTrue(layout.events[preservation_index][2].get("toggle"))
+        self.assertEqual(
+            layout.events[preservation_index][2].get("text"),
+            "Keep Original Cycles Nodes",
+        )
         self.assertLess(scope_index, material_index)
         override_index = next(
             index
@@ -184,6 +241,22 @@ class PanelHierarchyTests(unittest.TestCase):
             any(
                 event[0] == "label"
                 and event[1].get("text") == "Classic diffuse + glossy workflow"
+                for event in layout.events
+            )
+        )
+
+    def test_unchecked_preservation_option_explains_automatic_cleanup(self) -> None:
+        layout = _RecordingLayout()
+        _draw_conversion_console(
+            layout,
+            SimpleNamespace(scene=_scene(octanify_keep_cycles_nodes=False)),
+        )
+
+        self.assertTrue(
+            any(
+                event[0] == "label"
+                and event[1].get("text")
+                == "Removes Cycles material nodes after conversion"
                 for event in layout.events
             )
         )

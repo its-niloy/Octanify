@@ -18,7 +18,7 @@ from __future__ import annotations
 bl_info = {
     "name": "Octanify",
     "author": "Niloy Bhowmick",
-    "version": (1, 4, 0),
+    "version": (1, 4, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Octanify",
     "description": "Convert Cycles materials, lights, and Worlds to Octane",
@@ -28,6 +28,77 @@ bl_info = {
 import bpy
 
 from .ui import panel, operators
+
+
+_OCTANE_OUTPUT_COMPAT_DESCRIPTION = (
+    "Octanify compatibility state for Octane output nodes on Blender 5.1+"
+)
+_owns_octane_output_compatibility = False
+
+
+def _register_octane_output_compatibility() -> None:
+    """Provide the ShaderNodeTree property expected by Octane 31.10.
+
+    Octane's custom output callback mixes ``OctaneBaseNodeTree`` into its own
+    node-tree classes, but material and World graphs are Blender
+    ``ShaderNodeTree`` instances. Blender 5.1+ no longer accepts the callback's
+    attempt to create an arbitrary instance attribute, so register the RNA
+    property on the owning type when the Octane add-on has not done so.
+    """
+    global _owns_octane_output_compatibility
+
+    app = getattr(bpy, "app", None)
+    if tuple(getattr(app, "version", (0, 0, 0))) < (5, 1, 0):
+        return
+    shader_tree_type = getattr(bpy.types, "ShaderNodeTree", None)
+    if (
+        shader_tree_type is None
+        or hasattr(shader_tree_type, "active_output_name")
+    ):
+        return
+    try:
+        shader_tree_type.active_output_name = bpy.props.StringProperty(
+            name="Active Octane Output",
+            description=_OCTANE_OUTPUT_COMPAT_DESCRIPTION,
+            default="",
+            options={"HIDDEN"},
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        return
+    _owns_octane_output_compatibility = True
+
+
+def _unregister_octane_output_compatibility() -> None:
+    """Remove only the RNA property that this Octanify session created."""
+    global _owns_octane_output_compatibility
+
+    if not _owns_octane_output_compatibility:
+        return
+    shader_tree_type = getattr(bpy.types, "ShaderNodeTree", None)
+    if shader_tree_type is None:
+        _owns_octane_output_compatibility = False
+        return
+
+    properties = getattr(
+        getattr(shader_tree_type, "bl_rna", None),
+        "properties",
+        None,
+    )
+    prop = (
+        properties.get("active_output_name")
+        if properties is not None and hasattr(properties, "get")
+        else None
+    )
+    description = getattr(prop, "description", _OCTANE_OUTPUT_COMPAT_DESCRIPTION)
+    if (
+        hasattr(shader_tree_type, "active_output_name")
+        and description == _OCTANE_OUTPUT_COMPAT_DESCRIPTION
+    ):
+        try:
+            delattr(shader_tree_type, "active_output_name")
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+    _owns_octane_output_compatibility = False
 
 
 # ---------------------------------------------------------------------------
@@ -53,14 +124,14 @@ def _register_properties() -> None:
         default="ACTIVE",
     )
 
-    bpy.types.Scene.octanify_smart_conversion = bpy.props.BoolProperty(
-        name="Smart Conversion",
+    bpy.types.Scene.octanify_keep_cycles_nodes = bpy.props.BoolProperty(
+        name="Keep Original Cycles Nodes",
         description=(
-            "Keep the original Cycles graph and append a separate, "
-            "renderer-targeted Octane graph to the same material"
+            "Keep the original Cycles material graph alongside the converted "
+            "Octane graph; disable to remove the Cycles material nodes "
+            "automatically after a successful conversion"
         ),
         default=True,
-        options={"HIDDEN"},
     )
 
     bpy.types.Scene.octanify_auto_arrange = bpy.props.BoolProperty(
@@ -180,6 +251,8 @@ def _register_properties() -> None:
 def _unregister_properties() -> None:
     for name in (
         "octanify_batch_mode",
+        "octanify_keep_cycles_nodes",
+        # Removed in 1.4; clean up the old hidden property during live reloads.
         "octanify_smart_conversion",
         "octanify_auto_arrange",
         "octanify_color_nodes",
@@ -202,8 +275,9 @@ def _unregister_properties() -> None:
 # ---------------------------------------------------------------------------
 
 def register() -> None:
-    _register_properties()
+    _register_octane_output_compatibility()
     try:
+        _register_properties()
         panel.register()
         operators.register()
     except Exception:
@@ -218,6 +292,7 @@ def register() -> None:
         except Exception:
             pass
         _unregister_properties()
+        _unregister_octane_output_compatibility()
         raise
 
 
@@ -225,3 +300,4 @@ def unregister() -> None:
     operators.unregister()
     panel.unregister()
     _unregister_properties()
+    _unregister_octane_output_compatibility()

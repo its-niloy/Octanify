@@ -8,10 +8,11 @@ identity between two different renderers. **Approximate** conversions always
 appear in the conversion report. **Unsupported** nodes remain visible as red
 fallbacks and produce warnings instead of being silently removed.
 
-The current node-RNA validation baseline is Blender 5.1 with OctaneRender for
-Blender 31.9. Ordered candidates provide compatibility paths for other plugin
-versions, but a fallback candidate is not considered runtime-verified until it
-has been exercised in that installed Octane build.
+The current node-RNA validation baseline is Blender 5.2 with OctaneRender for
+Blender 31.10 (Octane SDK 2026.4). Runtime RNA discovery prioritizes registered
+node classes before legacy aliases. Ordered fallbacks retain compatibility paths
+for older plugin versions, but are not considered runtime-verified until they
+have been exercised in that installed Octane build.
 
 Primary references:
 

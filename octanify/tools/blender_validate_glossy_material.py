@@ -1,4 +1,4 @@
-"""Live Blender 5.1 + Octane 31.9 validation for the Glossy option.
+"""Live Blender 5.2 + Octane 31.10 validation for the Glossy option.
 
 Run with Blender's installed Octane add-on enabled::
 

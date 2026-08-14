@@ -1,4 +1,4 @@
-"""Live Blender 5.1 + Octane validation for Phase 4 node conversion.
+"""Live Blender 5.2 + Octane 31.10 validation for Phase 4 node conversion.
 
 Run with Blender's installed Octane add-on enabled::
 
@@ -8,6 +8,7 @@ Run with Blender's installed Octane add-on enabled::
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -120,8 +121,16 @@ def _close(actual, expected, tolerance: float = 1.0e-5) -> bool:
 
 
 def main() -> None:
+    octane_root = os.environ.get("OCTANE_ADDON_ROOT", "")
+    if octane_root and octane_root not in sys.path:
+        sys.path.insert(0, octane_root)
     if not addon_utils.check("octane")[1]:
-        addon_utils.enable("octane", default_set=False, persistent=False)
+        addon_utils.enable("octane", default_set=True, persistent=False)
+    if not addon_utils.check("octane")[1]:
+        raise RuntimeError(
+            "Octane failed to register; set OCTANE_ADDON_ROOT to the directory "
+            "that contains the octane package"
+        )
     from octanify.core.conversion_engine import convert_objects_materials
     _clear_scene()
 

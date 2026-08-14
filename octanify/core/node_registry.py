@@ -7,6 +7,60 @@ plus socket-level input/output maps for link reconstruction.
 from __future__ import annotations
 
 
+_FOLDED_MATERIAL_INPUT_TYPES = frozenset({
+    "ShaderNodeNormalMap",
+    "ShaderNodeBump",
+})
+
+
+def _prioritized_node_candidates(
+    candidates: list[str] | tuple[str, ...],
+) -> tuple[list[str], bool, bool]:
+    """Put RNA-registered node types first without dropping legacy aliases.
+
+    Octane 31.10 registers modern ``Octane*`` identifiers while many older
+    releases used ``ShaderNodeOct*`` aliases. Asking Blender to instantiate a
+    missing type raises an exception, which is expensive in large graphs.
+    Blender's RNA registry lets current identifiers win immediately while the
+    original ordering remains as a compatibility fallback when registry
+    introspection is unavailable.
+
+    Returns ``(ordered, registry_available, any_registered)``.
+    """
+    unique = list(dict.fromkeys(candidates))
+    try:
+        import bpy
+        resolver = getattr(
+            getattr(getattr(bpy, "types", None), "Node", None),
+            "bl_rna_get_subclass_py",
+            None,
+        )
+    except Exception:
+        resolver = None
+    if not callable(resolver):
+        return unique, False, False
+
+    registered: list[str] = []
+    unavailable: list[str] = []
+    for idname in unique:
+        try:
+            is_registered = resolver(idname) is not None
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            is_registered = False
+        (registered if is_registered else unavailable).append(idname)
+    return [*registered, *unavailable], True, bool(registered)
+
+
+def prioritize_node_candidates(
+    candidates: list[str] | tuple[str, ...],
+) -> list[str]:
+    """Return candidates ordered for the node types registered this session."""
+    ordered, _registry_available, _any_registered = (
+        _prioritized_node_candidates(candidates)
+    )
+    return ordered
+
+
 STANDARD_SURFACE_NODE_TYPES = frozenset({
     "OctaneStandardSurfaceMaterial",
     "ShaderNodeOctStandardSurfaceMat",
@@ -1468,6 +1522,8 @@ def create_octane_node(
     label: str = "",
     preferred_candidates: list[str] | None = None,
     base_material_type: str | None = None,
+    skip_if_all_unregistered: bool = False,
+    warn_if_missing: bool = True,
 ):
     """Try to create an Octane node using candidates list. Returns node or None."""
     from ..utils.logger import get_logger
@@ -1511,19 +1567,35 @@ def create_octane_node(
     except Exception:
         pass
 
-    return create_node_from_candidates(node_tree, candidates, label=label)
+    return create_node_from_candidates(
+        node_tree,
+        candidates,
+        label=label,
+        skip_if_all_unregistered=skip_if_all_unregistered,
+        warn_if_missing=warn_if_missing,
+    )
 
 
 def create_node_from_candidates(
     node_tree,
     candidates: list[str] | tuple[str, ...],
     label: str = "",
+    skip_if_all_unregistered: bool = False,
+    warn_if_missing: bool = True,
 ):
     """Create the first available node from an explicit candidate list."""
     from ..utils.logger import get_logger
     log = get_logger()
 
-    for idname in candidates:
+    ordered, registry_available, any_registered = (
+        _prioritized_node_candidates(candidates)
+    )
+    if not ordered:
+        return None
+    if skip_if_all_unregistered and registry_available and not any_registered:
+        return None
+
+    for idname in ordered:
         try:
             new_node = node_tree.nodes.new(type=idname)
             if label:
@@ -1532,5 +1604,6 @@ def create_node_from_candidates(
         except (RuntimeError, TypeError, KeyError):
             continue
 
-    log.warning("No available node found from candidates: %s", list(candidates))
+    if warn_if_missing:
+        log.warning("No available node found from candidates: %s", list(candidates))
     return None

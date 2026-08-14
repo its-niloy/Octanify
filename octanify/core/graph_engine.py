@@ -19,6 +19,7 @@ from .node_registry import (
     APPROXIMATION_NOTES,
     PASSTHROUGH_TYPES,
     SKIP_TYPES,
+    _FOLDED_MATERIAL_INPUT_TYPES,
     create_node_from_candidates,
     create_octane_node,
     get_contextual_node_candidates,
@@ -1145,6 +1146,17 @@ class GraphEngine:
                 label=info.label,
                 preferred_candidates=preferred_candidates,
                 base_material_type=self.base_material_type,
+                # Octane 31.10 intentionally has no standalone Normal Map or
+                # Bump texture nodes. They are folded into material inputs by
+                # the topology-aware pass after placeholder creation. Avoid
+                # exception-driven probes when RNA confirms every candidate
+                # is absent, while retaining real nodes on older add-ons.
+                skip_if_all_unregistered=(
+                    info.bl_idname in _FOLDED_MATERIAL_INPUT_TYPES
+                ),
+                warn_if_missing=(
+                    info.bl_idname not in _FOLDED_MATERIAL_INPUT_TYPES
+                ),
             )
 
             if new_node is not None:

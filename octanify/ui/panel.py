@@ -53,6 +53,24 @@ def _draw_conversion_console(
         icon="SHADING_RENDERED",
     )
 
+    preservation = console.row()
+    preservation.scale_y = 1.2
+    preservation.enabled = not is_active
+    preservation.prop(
+        scene,
+        "octanify_keep_cycles_nodes",
+        text="Keep Original Cycles Nodes",
+        toggle=True,
+        icon="NODETREE",
+    )
+
+    preservation_hint = console.row()
+    preservation_hint.enabled = False
+    if scene.octanify_keep_cycles_nodes:
+        preservation_hint.label(text="Keeps Cycles and Octane material graphs together")
+    else:
+        preservation_hint.label(text="Removes Cycles material nodes after conversion")
+
     console.separator(factor=0.45)
 
     console.label(text="Objects to Convert", icon="OBJECT_DATA")
@@ -216,7 +234,7 @@ def _draw_node_tools(
 
     note = box.row()
     note.enabled = False
-    note.label(text="Original Cycles nodes are kept by default")
+    note.label(text="Manual cleanup for already converted materials")
 
 
 def _draw_last_report(

@@ -1,4 +1,4 @@
-"""Blender 5.1 + Octane 31.9 validation for Phase 5 material controls."""
+"""Blender 5.2 + Octane 31.10 validation for Phase 5 material controls."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _enable_addons() -> None:
     if not addon_utils.check("octane")[1]:
         addon_utils.enable("octane", default_set=True, persistent=False)
     if not addon_utils.check("octane")[1]:
-        raise RuntimeError("Octane 31.9 did not register")
+        raise RuntimeError("Octane did not register")
 
 
 def _close(actual, expected, tolerance: float = 1.0e-5) -> bool:

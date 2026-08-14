@@ -565,11 +565,13 @@ def convert_world_to_octane(
     # environment exists. The authored Cycles output and links remain intact.
     _remove_replaced_nodes(node_tree, created)
 
-    # Octane 31.9 on Blender 5.1 raises from its active-output callback because
-    # ShaderNodeTree no longer accepts the add-on's dynamic RNA attribute.  New
-    # Octane World outputs are active by default, so only invoke the callback
-    # when a version actually creates an inactive node.
-    if not bool(getattr(output, "active", True)):
+    # Octane 31.10 expects ShaderNodeTree.active_output_name. Octanify registers
+    # that compatibility property on Blender 5.1+, but keep this guard for
+    # direct API use where the package register hook may not have run.
+    if (
+        not bool(getattr(output, "active", True))
+        and hasattr(node_tree, "active_output_name")
+    ):
         try:
             output.active = True
         except (AttributeError, RuntimeError, TypeError):

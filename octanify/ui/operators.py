@@ -347,6 +347,9 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
         self._color_nodes = getattr(
             context.scene, "octanify_color_nodes", True
         )
+        self._keep_cycles_nodes = getattr(
+            context.scene, "octanify_keep_cycles_nodes", True
+        )
         self._base_material_type = getattr(
             context.scene, "octanify_base_material", "STANDARD_SURFACE"
         )
@@ -367,6 +370,7 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
         self._lights_converted = 0
         self._world_converted = False
         self._scene_domains_done = False
+        self._cycles_nodes_deleted = 0
 
         if not (
             self._work_items
@@ -510,6 +514,19 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
         except (AttributeError, RuntimeError, TypeError):
             pass
 
+    def _cleanup_converted_material(self, material: bpy.types.Material) -> int:
+        """Remove the preserved source graph when the visible option is off."""
+        if (
+            material is None
+            or getattr(self, "_keep_cycles_nodes", True)
+        ):
+            return 0
+        deleted = _delete_cycles_nodes_from_material(material)
+        self._cycles_nodes_deleted = (
+            getattr(self, "_cycles_nodes_deleted", 0) + deleted
+        )
+        return deleted
+
     def invoke(self, context: bpy.types.Context, _event) -> set[str]:
         app = getattr(bpy, "app", None)
         if (
@@ -604,8 +621,10 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
                         self, "_smart_material_override", False
                     ),
                 )
-                if converted is not None and slot is not None:
-                    slot.material = converted
+                if converted is not None:
+                    self._cleanup_converted_material(converted)
+                    if slot is not None:
+                        slot.material = converted
         except Exception as exc:
             log.error("Conversion failed: %s", exc, exc_info=True)
             self.report({"ERROR"}, f"Conversion error: {exc}")
@@ -646,7 +665,7 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
         self._begin_progress(context)
 
         try:
-            convert_objects_materials(
+            converted_materials = convert_objects_materials(
                 self._objects,
                 gamma_value=self._gamma,
                 smart_conversion=True,
@@ -663,6 +682,8 @@ class OCTANIFY_OT_convert(bpy.types.Operator):
                     self, "_smart_material_override", False
                 ),
             )
+            for material in converted_materials:
+                self._cleanup_converted_material(material)
             _set_progress(
                 context,
                 95,
@@ -925,7 +946,7 @@ class OCTANIFY_OT_preview_node_viewport(bpy.types.Operator):
                 matte = n
                 break
         if not matte:
-            for diffuse_type in ("ShaderNodeOctDiffuseMat", "OctaneDiffuseMaterial"):
+            for diffuse_type in ("OctaneDiffuseMaterial", "ShaderNodeOctDiffuseMat"):
                 try:
                     matte = nodes.new(diffuse_type)
                     matte.label = "Viewport Preview Diffuse"
@@ -943,7 +964,7 @@ class OCTANIFY_OT_preview_node_viewport(bpy.types.Operator):
                 emission = n
                 break
         if not emission:
-            for emission_type in ("ShaderNodeOctTextureEmission", "OctaneTextureEmission"):
+            for emission_type in ("OctaneTextureEmission", "ShaderNodeOctTextureEmission"):
                 try:
                     emission = nodes.new(emission_type)
                     emission.label = "Viewport Preview Emission"

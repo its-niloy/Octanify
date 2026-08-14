@@ -69,8 +69,10 @@ from octanify.core.conversion_engine import (
 from octanify.core.geonodes_scan import collect_geometry_node_materials
 from octanify.core.node_registry import (
     NODE_TYPE_MAP,
+    create_node_from_candidates,
     get_contextual_node_candidates,
     is_glossy_material_node,
+    prioritize_node_candidates,
     principled_material_candidates,
     resolve_input_socket,
     resolve_output_socket,
@@ -1727,6 +1729,51 @@ class OperatorUtilityTests(unittest.TestCase):
         self.assertTrue(octane_output.is_active_output)
         self.assertEqual(octane_output.target, "ALL")
 
+    def test_checked_keep_option_does_not_delete_cycles_nodes(self) -> None:
+        material = SimpleNamespace(name="Preserved Material")
+        operator = OCTANIFY_OT_convert()
+        operator._keep_cycles_nodes = True
+
+        with patch(
+            "octanify.ui.operators._delete_cycles_nodes_from_material",
+        ) as cleanup_mock:
+            deleted = operator._cleanup_converted_material(material)
+
+        self.assertEqual(deleted, 0)
+        cleanup_mock.assert_not_called()
+
+    def test_synchronous_conversion_applies_automatic_cycles_cleanup(self) -> None:
+        material = SimpleNamespace(name="Background Material")
+        operator = OCTANIFY_OT_convert()
+        operator._objects = [SimpleNamespace(name="Object")]
+        operator._gamma = 2.2
+        operator._auto_arrange = True
+        operator._color_nodes = True
+        operator._keep_cycles_nodes = False
+        operator._base_material_type = "STANDARD_SURFACE"
+        operator._smart_material_override = False
+        operator._cycles_nodes_deleted = 0
+
+        with patch.object(operator, "_prepare_job", return_value=True), patch.object(
+            operator, "_begin_progress"
+        ), patch.object(operator, "_end_progress"), patch.object(
+            operator, "_convert_scene_domains"
+        ), patch.object(operator, "_report_summary"), patch(
+            "octanify.ui.operators._set_progress"
+        ), patch(
+            "octanify.ui.operators.convert_objects_materials",
+            return_value=[material],
+        ) as convert_mock, patch(
+            "octanify.ui.operators._delete_cycles_nodes_from_material",
+            return_value=4,
+        ) as cleanup_mock:
+            result = operator.execute(SimpleNamespace())
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertTrue(convert_mock.call_args.kwargs["smart_conversion"])
+        cleanup_mock.assert_called_once_with(material)
+        self.assertEqual(operator._cycles_nodes_deleted, 4)
+
     def test_progress_callback_updates_percentage_and_label(self) -> None:
         updates = []
         context = SimpleNamespace(
@@ -1783,9 +1830,13 @@ class OperatorUtilityTests(unittest.TestCase):
         with patch(
             "octanify.ui.operators.convert_material",
             return_value=material,
-        ) as convert_mock:
+        ) as convert_mock, patch(
+            "octanify.ui.operators._delete_cycles_nodes_from_material",
+            return_value=3,
+        ) as cleanup_mock:
             operator._auto_arrange = False
             operator._color_nodes = False
+            operator._keep_cycles_nodes = False
             result = operator.modal(context, SimpleNamespace(type="TIMER"))
 
         self.assertEqual(result, {"FINISHED"})
@@ -1796,6 +1847,8 @@ class OperatorUtilityTests(unittest.TestCase):
         self.assertEqual(progress_ended, [True])
         self.assertFalse(convert_mock.call_args.kwargs["auto_arrange"])
         self.assertFalse(convert_mock.call_args.kwargs["color_nodes"])
+        cleanup_mock.assert_called_once_with(material)
+        self.assertEqual(operator._cycles_nodes_deleted, 3)
 
 
 class LayoutTests(unittest.TestCase):
@@ -2268,6 +2321,74 @@ class SocketResolutionTests(unittest.TestCase):
 
 
 class ModernOctaneNodeTests(unittest.TestCase):
+    def test_registered_octane_3110_node_types_are_prioritized(self) -> None:
+        node_type = bpy.types.Node
+        had_resolver = hasattr(node_type, "bl_rna_get_subclass_py")
+        original_resolver = getattr(node_type, "bl_rna_get_subclass_py", None)
+        attempts = []
+
+        class _ProbeNodes:
+            @staticmethod
+            def new(*, type):
+                attempts.append(type)
+                return SimpleNamespace(label="")
+
+        node_type.bl_rna_get_subclass_py = staticmethod(
+            lambda idname: object()
+            if idname == "OctaneDiffuseMaterial"
+            else None
+        )
+        try:
+            candidates = (
+                "ShaderNodeOctDiffuseMat",
+                "OctaneDiffuseMaterial",
+            )
+            self.assertEqual(
+                prioritize_node_candidates(candidates)[0],
+                "OctaneDiffuseMaterial",
+            )
+            created = create_node_from_candidates(
+                SimpleNamespace(nodes=_ProbeNodes()),
+                candidates,
+            )
+        finally:
+            if had_resolver:
+                node_type.bl_rna_get_subclass_py = original_resolver
+            else:
+                delattr(node_type, "bl_rna_get_subclass_py")
+
+        self.assertIsNotNone(created)
+        self.assertEqual(attempts, ["OctaneDiffuseMaterial"])
+
+    def test_expected_fold_skips_unregistered_node_probes(self) -> None:
+        node_type = bpy.types.Node
+        had_resolver = hasattr(node_type, "bl_rna_get_subclass_py")
+        original_resolver = getattr(node_type, "bl_rna_get_subclass_py", None)
+        attempts = []
+
+        class _ProbeNodes:
+            @staticmethod
+            def new(*, type):
+                attempts.append(type)
+                raise AssertionError("unregistered node type was probed")
+
+        node_type.bl_rna_get_subclass_py = staticmethod(lambda _idname: None)
+        try:
+            created = create_node_from_candidates(
+                SimpleNamespace(nodes=_ProbeNodes()),
+                ("OctaneNormalMap", "ShaderNodeOctNormalMap"),
+                skip_if_all_unregistered=True,
+                warn_if_missing=False,
+            )
+        finally:
+            if had_resolver:
+                node_type.bl_rna_get_subclass_py = original_resolver
+            else:
+                delattr(node_type, "bl_rna_get_subclass_py")
+
+        self.assertIsNone(created)
+        self.assertEqual(attempts, [])
+
     def test_modern_material_nodes_are_preferred_over_legacy_ids(self) -> None:
         self.assertEqual(
             NODE_TYPE_MAP["ShaderNodeBsdfPrincipled"][0],

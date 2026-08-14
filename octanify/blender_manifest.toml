@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "octanify"
 name = "Octanify"
-version = "1.4.0"
+version = "1.4.1"
 tagline = "Convert Cycles materials, lights, and worlds to Octane"
 maintainer = "Niloy Bhowmick"
 type = "add-on"
