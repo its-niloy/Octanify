@@ -395,7 +395,7 @@ The clean release archive contains the license and runtime add-on files: `LICENS
 
 ### Validation
 
-The repository currently passes 151 Python regression tests. Node-RNA-sensitive paths have also been exercised in Blender 5.1 with OctaneRender for Blender 31.9, including Composite Texture layers, Cinema 4D procedural scale matching at 1 m, 2 m, and 5 m object sizes, exact Texture/Vertex displacement selection, Glossy target mapping, smart SSS overrides, medium-density/topology reconstruction, one-level and three-level shader groups through the real conversion operator, nested-frame arrangement, disabled custom coloring, renderer-targeted Light outputs, preserved World outputs, and Octane active-output resolution. These checks validate graph structure and parameter transfer; renderer-to-renderer pixel equivalence still requires matched reference renders, as described in [`octanify/MATERIAL_FIDELITY.md`](octanify/MATERIAL_FIDELITY.md).
+The repository currently passes 151 Python regression tests. Node-RNA-sensitive paths have also been exercised in Blender 5.2 with OctaneRender for Blender 31.10, including Composite Texture layers, Cinema 4D procedural scale matching at 1 m, 2 m, and 5 m object sizes, exact Texture/Vertex displacement selection, Glossy target mapping, smart SSS overrides, medium-density/topology reconstruction, one-level and three-level shader groups through the real conversion operator, nested-frame arrangement, disabled custom coloring, renderer-targeted Light outputs, preserved World outputs, and Octane active-output resolution. These checks validate graph structure and parameter transfer; renderer-to-renderer pixel equivalence still requires matched reference renders, as described in [`octanify/MATERIAL_FIDELITY.md`](octanify/MATERIAL_FIDELITY.md).
 
 ---
 
@@ -414,9 +414,9 @@ The repository currently passes 151 Python regression tests. Node-RNA-sensitive 
 
 ### Runtime-verified configuration and compatibility note
 
-The current node-RNA validation baseline is Blender 5.1 with OctaneRender for Blender 31.9. Other supported Blender/Octane combinations use ordered node-class fallbacks but should be checked against the conversion report.
+The current node-RNA validation baseline is Blender 5.2 with OctaneRender for Blender 31.10. Other supported Blender/Octane combinations use ordered node-class fallbacks but should be checked against the conversion report.
 
-Octane 31.9 may print an `active_output_name` callback traceback when Blender 5.1 activates a custom Octane World output. In validated conversions the property is still applied and Octane resolves the generated World output correctly. Treat it as a conversion failure only when the Octanify report also records a failed World conversion or the generated environment output is missing/unlinked.
+Octane 31.10 may print an `active_output_name` callback traceback when Blender 5.2 activates a custom Octane World output. In validated conversions the property is still applied and Octane resolves the generated World output correctly. Treat it as a conversion failure only when the Octanify report also records a failed World conversion or the generated environment output is missing/unlinked.
 
 ---
 
