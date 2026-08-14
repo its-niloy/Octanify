@@ -10,7 +10,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0--or--later-blue?style=for-the-badge"></a>
   <br>
   <a href="#"><img src="https://img.shields.io/badge/Blender-4.2%2B-F5792A?style=for-the-badge&logo=blender"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Runtime%20Verified-Blender%205.1%20%2B%20Octane%2031.9-green?style=for-the-badge"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Runtime%20Verified-Blender%205.2%20%2B%20Octane%2031.10-green?style=for-the-badge"></a>
 </p>
 
 [**Interface**](#the-interface) • [**Features**](#features) • [**How It Works**](#how-it-works) • [**Supported Nodes**](#supported-nodes) • [**Installation**](#installation)
